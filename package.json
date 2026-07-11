@@ -1,0 +1,33 @@
+{
+  "name": "religence-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "verify:excel": "tsx scripts/verify-master-data.ts"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^3.7.3",
+    "@microsoft/microsoft-graph-client": "^3.0.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^9.7.4",
+    "nodemailer": "^9.0.3",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.23",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.18.1",
+    "@types/nodemailer": "^8.0.1",
+    "tsx": "^4.20.4",
+    "typescript": "^5.9.2"
+  }
+}

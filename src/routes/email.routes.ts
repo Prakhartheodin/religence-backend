@@ -1,0 +1,308 @@
+import { Router, type Request, type Response } from 'express';
+import config from '../config.js';
+import { HttpError } from '../http-error.js';
+import { requireAuth } from '../middleware/require-auth.js';
+import {
+  batchModifyThreads,
+  disconnectOutlookAccount,
+  forwardMessage,
+  getAttachment,
+  getMessage,
+  getMicrosoftAuthUrl,
+  getThread,
+  handleMicrosoftCallback,
+  listLabels,
+  listOutlookAccounts,
+  listThreads,
+  modifyMessage,
+  replyAllMessage,
+  replyMessage,
+  sendMessage,
+  trashThreads,
+} from '../services/outlook.service.js';
+import {
+  listEmailTemplates,
+  replaceEmailTemplates,
+} from '../services/email-templates.service.js';
+
+export const emailRouter = Router();
+
+emailRouter.use(requireAuth);
+
+function getUserId(req: Request): string {
+  const verified = (req as Request & { userId?: string }).userId;
+  // Verified Firebase uid for JSON API calls; query.userId only on the public
+  // OAuth start route, which requireAuth lets through.
+  return (
+    String(verified || req.query.userId || config.demoUserId).trim() ||
+    config.demoUserId
+  );
+}
+
+function asString(value: unknown, field: string): string {
+  const v = String(value || '').trim();
+  if (!v) throw new HttpError(400, `${field} is required`);
+  return v;
+}
+
+function optionalString(value: unknown): string | undefined {
+  const v = String(value || '').trim();
+  return v || undefined;
+}
+
+emailRouter.get('/auth/microsoft/start', async (req, res, next) => {
+  try {
+    const url = await getMicrosoftAuthUrl(getUserId(req));
+    res.redirect(url);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.get('/auth/microsoft', async (req, res, next) => {
+  try {
+    const url = await getMicrosoftAuthUrl(getUserId(req));
+    res.json({ url });
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.get('/auth/microsoft/callback', async (req, res, next) => {
+  try {
+    const code = asString(req.query.code, 'code');
+    const state = asString(req.query.state, 'state');
+    const account = await handleMicrosoftCallback(code, state);
+    const successUrl = new URL('/inbox', config.corsOrigin);
+    successUrl.searchParams.set('outlook_connected', account.email);
+    res.redirect(successUrl.toString());
+  } catch (err) {
+    if (err instanceof HttpError) {
+      const errorUrl = new URL('/inbox', config.corsOrigin);
+      errorUrl.searchParams.set('outlook_error', err.message);
+      return res.redirect(errorUrl.toString());
+    }
+    next(err);
+  }
+});
+
+emailRouter.get('/accounts', async (req, res, next) => {
+  try {
+    const accounts = await listOutlookAccounts(getUserId(req));
+    res.json(accounts);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.delete('/accounts/:id', async (req, res, next) => {
+  try {
+    await disconnectOutlookAccount(getUserId(req), asString(req.params.id, 'id'));
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.get('/templates', async (req, res, next) => {
+  try {
+    const templates = await listEmailTemplates(getUserId(req));
+    res.json(templates);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.put('/templates', async (req, res, next) => {
+  try {
+    const rawTemplates = Array.isArray(req.body)
+      ? req.body
+      : req.body?.templates;
+    const templates = await replaceEmailTemplates(getUserId(req), rawTemplates);
+    res.json(templates);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.get('/labels', async (req, res, next) => {
+  try {
+    const labels = await listLabels(
+      getUserId(req),
+      asString(req.query.accountId, 'accountId')
+    );
+    res.json(labels);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.get('/threads', async (req, res, next) => {
+  try {
+    const result = await listThreads(getUserId(req), asString(req.query.accountId, 'accountId'), {
+      labelId: optionalString(req.query.labelId),
+      pageToken: optionalString(req.query.pageToken),
+      pageSize: req.query.pageSize ? Number(req.query.pageSize) : undefined,
+      query: optionalString(req.query.q),
+    });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.get('/threads/:id', async (req, res, next) => {
+  try {
+    const thread = await getThread(
+      getUserId(req),
+      asString(req.query.accountId, 'accountId'),
+      asString(req.params.id, 'id')
+    );
+    res.json(thread);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.get('/messages/:id', async (req, res, next) => {
+  try {
+    const message = await getMessage(
+      getUserId(req),
+      asString(req.query.accountId, 'accountId'),
+      asString(req.params.id, 'id')
+    );
+    res.json(message);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.get(
+  '/messages/:messageId/attachments/:attachmentId',
+  async (req: Request, res: Response, next) => {
+    try {
+      const base64 = await getAttachment(
+        getUserId(req),
+        asString(req.query.accountId, 'accountId'),
+        asString(req.params.messageId, 'messageId'),
+        asString(req.params.attachmentId, 'attachmentId')
+      );
+      const buf = Buffer.from(base64, 'base64');
+      res.set('Content-Disposition', 'attachment');
+      res.send(buf);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+emailRouter.post('/messages/send', async (req, res, next) => {
+  try {
+    const result = await sendMessage(getUserId(req), asString(req.body.accountId, 'accountId'), {
+      to: req.body.to,
+      cc: req.body.cc,
+      bcc: req.body.bcc,
+      subject: req.body.subject,
+      html: req.body.html,
+    });
+    res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.post('/messages/:id/reply', async (req, res, next) => {
+  try {
+    const result = await replyMessage(
+      getUserId(req),
+      asString(req.body.accountId, 'accountId'),
+      asString(req.params.id, 'id'),
+      {
+        html: req.body.html,
+      }
+    );
+    res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.post('/messages/:id/reply-all', async (req, res, next) => {
+  try {
+    const result = await replyAllMessage(
+      getUserId(req),
+      asString(req.body.accountId, 'accountId'),
+      asString(req.params.id, 'id'),
+      {
+        html: req.body.html,
+      }
+    );
+    res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.post('/messages/:id/forward', async (req, res, next) => {
+  try {
+    const result = await forwardMessage(
+      getUserId(req),
+      asString(req.body.accountId, 'accountId'),
+      asString(req.params.id, 'id'),
+      {
+        to: req.body.to,
+        html: req.body.html,
+      }
+    );
+    res.status(201).json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.patch('/messages/:id', async (req, res, next) => {
+  try {
+    const result = await modifyMessage(
+      getUserId(req),
+      asString(req.query.accountId, 'accountId'),
+      asString(req.params.id, 'id'),
+      {
+        addLabelIds: Array.isArray(req.body?.addLabelIds) ? req.body.addLabelIds : [],
+        removeLabelIds: Array.isArray(req.body?.removeLabelIds) ? req.body.removeLabelIds : [],
+      }
+    );
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.post('/threads/batch-modify', async (req, res, next) => {
+  try {
+    const result = await batchModifyThreads(
+      getUserId(req),
+      asString(req.body.accountId, 'accountId'),
+      Array.isArray(req.body.threadIds) ? req.body.threadIds : [],
+      {
+        addLabelIds: Array.isArray(req.body.addLabelIds) ? req.body.addLabelIds : [],
+        removeLabelIds: Array.isArray(req.body.removeLabelIds) ? req.body.removeLabelIds : [],
+      }
+    );
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.post('/threads/trash', async (req, res, next) => {
+  try {
+    const result = await trashThreads(
+      getUserId(req),
+      asString(req.body.accountId, 'accountId'),
+      Array.isArray(req.body.threadIds) ? req.body.threadIds : []
+    );
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
