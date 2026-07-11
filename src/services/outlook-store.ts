@@ -9,6 +9,10 @@ function toOutlookAccount(doc: Partial<OutlookAccount> | null | undefined): Outl
     userId: String(doc.userId),
     provider: 'outlook',
     email: String(doc.email).toLowerCase(),
+    displayName:
+      doc.displayName === null || doc.displayName === undefined
+        ? null
+        : String(doc.displayName).trim() || null,
     accessToken: String(doc.accessToken ?? ''),
     refreshToken:
       doc.refreshToken === null || doc.refreshToken === undefined
@@ -40,6 +44,7 @@ export async function listOutlookAccountsByUser(userId: string): Promise<EmailAc
       id: a.id,
       provider: a.provider,
       email: a.email,
+      displayName: a.displayName ?? null,
       status: a.status,
       createdAt: a.createdAt,
     }));
@@ -73,9 +78,26 @@ export async function findOutlookAccountByEmail(
   return toOutlookAccount(doc);
 }
 
+export async function findActiveOutlookAccountsByUser(
+  userId: string
+): Promise<OutlookAccount[]> {
+  const docs = await OutlookAccountModel.find({
+    userId,
+    provider: 'outlook',
+    status: 'active',
+  })
+    .sort({ updatedAt: -1 })
+    .lean();
+
+  return docs
+    .map((doc) => toOutlookAccount(doc))
+    .filter((a): a is OutlookAccount => Boolean(a));
+}
+
 export async function upsertOutlookAccount(input: {
   userId: string;
   email: string;
+  displayName?: string | null;
   accessToken: string;
   refreshToken: string | null;
   tokenExpiry: string | null;
@@ -84,12 +106,15 @@ export async function upsertOutlookAccount(input: {
   const existing = await findOutlookAccountByEmail(input.userId, email);
   const now = new Date().toISOString();
 
+  const displayName = input.displayName?.trim() || null;
+
   if (existing) {
     const updated = await OutlookAccountModel.findOneAndUpdate(
       { id: existing.id },
       {
         $set: {
           email,
+          displayName: displayName ?? existing.displayName ?? null,
           accessToken: input.accessToken,
           refreshToken: input.refreshToken,
           tokenExpiry: input.tokenExpiry,
@@ -97,7 +122,7 @@ export async function upsertOutlookAccount(input: {
           updatedAt: now,
         },
       },
-      { new: true, lean: true }
+      { returnDocument: 'after', lean: true }
     );
     const next = toOutlookAccount(updated);
     if (!next) throw new Error('Failed to update Outlook account document');
@@ -109,6 +134,7 @@ export async function upsertOutlookAccount(input: {
     userId: input.userId,
     provider: 'outlook',
     email,
+    displayName,
     accessToken: input.accessToken,
     refreshToken: input.refreshToken,
     tokenExpiry: input.tokenExpiry,
@@ -121,25 +147,27 @@ export async function upsertOutlookAccount(input: {
 }
 
 export async function updateOutlookAccount(
+  userId: string,
   accountId: string,
   patch: Partial<OutlookAccount>
 ): Promise<OutlookAccount | null> {
   const updated = await OutlookAccountModel.findOneAndUpdate(
-    { id: accountId },
+    { id: accountId, userId, provider: 'outlook' },
     {
       $set: {
         ...patch,
         updatedAt: new Date().toISOString(),
       },
     },
-    { new: true, lean: true }
+    { returnDocument: 'after', lean: true }
   );
   return toOutlookAccount(updated);
 }
 
 export async function setOutlookAccountStatus(
+  userId: string,
   accountId: string,
   status: AccountStatus
 ): Promise<OutlookAccount | null> {
-  return updateOutlookAccount(accountId, { status });
+  return updateOutlookAccount(userId, accountId, { status });
 }

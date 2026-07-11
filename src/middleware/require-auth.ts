@@ -2,12 +2,11 @@ import type { NextFunction, Request, Response } from 'express';
 import { HttpError } from '../http-error.js';
 import { verifyJwt } from '../services/auth.service.js';
 
-// Browser-navigation OAuth routes can't send an Authorization header; they
-// carry the user id in the query/state instead, so they stay public.
-const PUBLIC_PREFIXES = ['/auth/microsoft'];
+// OAuth browser redirects can't send Authorization; they use signed connect tokens.
+const PUBLIC_PATHS = new Set(['/auth/microsoft/start', '/auth/microsoft/callback']);
 
 export function requireAuth(req: Request, _res: Response, next: NextFunction): void {
-  if (req.method === 'OPTIONS' || PUBLIC_PREFIXES.some((p) => req.path.startsWith(p))) {
+  if (req.method === 'OPTIONS' || PUBLIC_PATHS.has(req.path)) {
     return next();
   }
   const header = req.header('authorization') ?? '';

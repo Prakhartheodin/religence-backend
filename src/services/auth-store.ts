@@ -21,7 +21,14 @@ export type OneTimeToken = {
   expiresAt: number;
 };
 
-type DB = { users: User[]; tokens: OneTimeToken[] };
+type ConsumedVerify = { userId: string; consumedAt: number };
+
+type DB = {
+  users: User[];
+  tokens: OneTimeToken[];
+  /** Recently consumed verify tokens — idempotent retries (e.g. React Strict Mode). */
+  consumedVerify?: Record<string, ConsumedVerify>;
+};
 
 const FILE = resolve(process.env.AUTH_STORE_PATH ?? 'data/auth.json');
 let db: DB = load();
@@ -75,4 +82,30 @@ export function consumeToken(tokenHash: string, purpose: OneTimeToken['purpose']
   const [tok] = db.tokens.splice(idx, 1);
   save();
   return tok.expiresAt < Date.now() ? null : tok.userId;
+}
+
+const CONSUMED_VERIFY_TTL_MS = 24 * 3600 * 1000;
+
+function pruneConsumedVerify(): void {
+  if (!db.consumedVerify) return;
+  const cutoff = Date.now() - CONSUMED_VERIFY_TTL_MS;
+  for (const [hash, entry] of Object.entries(db.consumedVerify)) {
+    if (entry.consumedAt < cutoff) delete db.consumedVerify[hash];
+  }
+}
+
+/** Remember a consumed verify token so duplicate requests still succeed. */
+export function recordConsumedVerify(tokenHash: string, userId: string): void {
+  if (!db.consumedVerify) db.consumedVerify = {};
+  pruneConsumedVerify();
+  db.consumedVerify[tokenHash] = { userId, consumedAt: Date.now() };
+  save();
+}
+
+/** Returns userId if this verify token was recently consumed successfully. */
+export function findConsumedVerify(tokenHash: string): string | null {
+  const entry = db.consumedVerify?.[tokenHash];
+  if (!entry) return null;
+  if (Date.now() - entry.consumedAt > CONSUMED_VERIFY_TTL_MS) return null;
+  return entry.userId;
 }

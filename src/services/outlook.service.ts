@@ -3,8 +3,12 @@ import { Client } from '@microsoft/microsoft-graph-client';
 import config from '../config.js';
 import { HttpError } from '../http-error.js';
 import {
+  issueOutlookConnectToken,
+  verifyOutlookConnectToken,
+} from './auth.service.js';
+import {
   findOutlookAccountById,
-  listOutlookAccountsByUser,
+  findActiveOutlookAccountsByUser,
   setOutlookAccountStatus,
   updateOutlookAccount,
   upsertOutlookAccount,
@@ -76,15 +80,13 @@ function createGraphClient(accessToken: string): Client {
 }
 
 function buildState(userId: string): string {
-  return Buffer.from(JSON.stringify({ userId }), 'utf8').toString('base64url');
+  return issueOutlookConnectToken(userId);
 }
 
 function parseState(stateEncoded: string): { userId?: string } {
   if (!stateEncoded) return {};
   try {
-    return JSON.parse(Buffer.from(stateEncoded, 'base64url').toString('utf8')) as {
-      userId?: string;
-    };
+    return { userId: verifyOutlookConnectToken(stateEncoded) };
   } catch {
     return {};
   }
@@ -302,7 +304,7 @@ async function refreshAccessToken(account: OutlookAccount): Promise<OutlookAccou
   }
 
   if (!result.ok || typeof result.payload.access_token !== 'string') {
-    await updateOutlookAccount(account.id, { status: 'error' });
+    await updateOutlookAccount(account.userId, account.id, { status: 'error' });
     throw new HttpError(
       401,
       typeof result.payload.error_description === 'string'
@@ -314,7 +316,7 @@ async function refreshAccessToken(account: OutlookAccount): Promise<OutlookAccou
   const expiresIn =
     typeof result.payload.expires_in === 'number' ? result.payload.expires_in : 3600;
   const tokenExpiry = new Date(Date.now() + Math.max(60, expiresIn) * 1000).toISOString();
-  const refreshed = await updateOutlookAccount(account.id, {
+  const refreshed = await updateOutlookAccount(account.userId, account.id, {
     accessToken: result.payload.access_token as string,
     refreshToken:
       typeof result.payload.refresh_token === 'string'
@@ -432,14 +434,18 @@ export async function handleMicrosoftCallback(
   }
 
   const client = createGraphClient(tokenResponse.accessToken);
-  const me = (await client.api('/me').select('mail,userPrincipalName').get()) as {
+  const me = (await client.api('/me').select('mail,userPrincipalName,displayName,givenName,surname').get()) as {
     mail?: string;
     userPrincipalName?: string;
+    displayName?: string;
+    givenName?: string;
+    surname?: string;
   };
   const email = String(me.mail || me.userPrincipalName || '').trim().toLowerCase();
   if (!email) {
     throw new HttpError(400, 'Could not resolve mailbox email from Microsoft profile');
   }
+  const displayName = resolveMicrosoftDisplayName(me);
 
   const refreshToken =
     (tokenResponse as unknown as { refreshToken?: string }).refreshToken ||
@@ -452,6 +458,7 @@ export async function handleMicrosoftCallback(
   const account = await upsertOutlookAccount({
     userId: parsed.userId,
     email,
+    displayName,
     accessToken: tokenResponse.accessToken,
     refreshToken,
     tokenExpiry,
@@ -461,18 +468,67 @@ export async function handleMicrosoftCallback(
     id: account.id,
     provider: account.provider,
     email: account.email,
+    displayName: account.displayName ?? null,
     status: account.status,
     createdAt: account.createdAt,
   };
 }
 
+function resolveMicrosoftDisplayName(me: {
+  displayName?: string;
+  givenName?: string;
+  surname?: string;
+}): string | null {
+  const display = String(me.displayName || '').trim();
+  if (display) return display;
+  const full = [me.givenName, me.surname]
+    .map((part) => String(part || '').trim())
+    .filter(Boolean)
+    .join(' ');
+  return full || null;
+}
+
+async function refreshAccountDisplayNameIfMissing(
+  account: OutlookAccount
+): Promise<OutlookAccount> {
+  if (account.displayName?.trim()) return account;
+  try {
+    const valid = await ensureValidAccessToken(account);
+    const client = createGraphClient(valid.accessToken);
+    const me = (await client
+      .api('/me')
+      .select('displayName,givenName,surname')
+      .get()) as {
+      displayName?: string;
+      givenName?: string;
+      surname?: string;
+    };
+    const displayName = resolveMicrosoftDisplayName(me);
+    if (!displayName) return account;
+    return (await updateOutlookAccount(account.userId, account.id, { displayName })) ?? account;
+  } catch {
+    return account;
+  }
+}
+
 export async function listOutlookAccounts(userId: string): Promise<EmailAccountPublic[]> {
-  return await listOutlookAccountsByUser(userId);
+  const accounts = await findActiveOutlookAccountsByUser(userId);
+  const refreshed = await Promise.all(
+    accounts.map((account) => refreshAccountDisplayNameIfMissing(account))
+  );
+  return refreshed.map((account) => ({
+    id: account.id,
+    provider: account.provider,
+    email: account.email,
+    displayName: account.displayName ?? null,
+    status: account.status,
+    createdAt: account.createdAt,
+  }));
 }
 
 export async function disconnectOutlookAccount(userId: string, accountId: string): Promise<void> {
   const account = await requireAccountForUser(userId, accountId);
-  await setOutlookAccountStatus(account.id, 'revoked');
+  await setOutlookAccountStatus(userId, account.id, 'revoked');
 }
 
 export async function listLabels(userId: string, accountId: string): Promise<EmailLabel[]> {

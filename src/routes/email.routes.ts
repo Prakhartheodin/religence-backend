@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import config from '../config.js';
 import { HttpError } from '../http-error.js';
 import { requireAuth } from '../middleware/require-auth.js';
+import { verifyOutlookConnectToken } from '../services/auth.service.js';
 import {
   batchModifyThreads,
   disconnectOutlookAccount,
@@ -29,14 +30,10 @@ export const emailRouter = Router();
 
 emailRouter.use(requireAuth);
 
-function getUserId(req: Request): string {
-  const verified = (req as Request & { userId?: string }).userId;
-  // Verified Firebase uid for JSON API calls; query.userId only on the public
-  // OAuth start route, which requireAuth lets through.
-  return (
-    String(verified || req.query.userId || config.demoUserId).trim() ||
-    config.demoUserId
-  );
+function requireUserId(req: Request): string {
+  const userId = (req as Request & { userId?: string }).userId;
+  if (!userId) throw new HttpError(401, 'authentication required');
+  return userId;
 }
 
 function asString(value: unknown, field: string): string {
@@ -52,7 +49,10 @@ function optionalString(value: unknown): string | undefined {
 
 emailRouter.get('/auth/microsoft/start', async (req, res, next) => {
   try {
-    const url = await getMicrosoftAuthUrl(getUserId(req));
+    const connectToken = String(req.query.connectToken ?? '').trim();
+    if (!connectToken) throw new HttpError(401, 'connect token required');
+    const userId = verifyOutlookConnectToken(connectToken);
+    const url = await getMicrosoftAuthUrl(userId);
     res.redirect(url);
   } catch (err) {
     next(err);
@@ -61,7 +61,7 @@ emailRouter.get('/auth/microsoft/start', async (req, res, next) => {
 
 emailRouter.get('/auth/microsoft', async (req, res, next) => {
   try {
-    const url = await getMicrosoftAuthUrl(getUserId(req));
+    const url = await getMicrosoftAuthUrl(requireUserId(req));
     res.json({ url });
   } catch (err) {
     next(err);
@@ -88,7 +88,7 @@ emailRouter.get('/auth/microsoft/callback', async (req, res, next) => {
 
 emailRouter.get('/accounts', async (req, res, next) => {
   try {
-    const accounts = await listOutlookAccounts(getUserId(req));
+    const accounts = await listOutlookAccounts(requireUserId(req));
     res.json(accounts);
   } catch (err) {
     next(err);
@@ -97,7 +97,7 @@ emailRouter.get('/accounts', async (req, res, next) => {
 
 emailRouter.delete('/accounts/:id', async (req, res, next) => {
   try {
-    await disconnectOutlookAccount(getUserId(req), asString(req.params.id, 'id'));
+    await disconnectOutlookAccount(requireUserId(req), asString(req.params.id, 'id'));
     res.json({ success: true });
   } catch (err) {
     next(err);
@@ -106,7 +106,7 @@ emailRouter.delete('/accounts/:id', async (req, res, next) => {
 
 emailRouter.get('/templates', async (req, res, next) => {
   try {
-    const templates = await listEmailTemplates(getUserId(req));
+    const templates = await listEmailTemplates(requireUserId(req));
     res.json(templates);
   } catch (err) {
     next(err);
@@ -118,7 +118,7 @@ emailRouter.put('/templates', async (req, res, next) => {
     const rawTemplates = Array.isArray(req.body)
       ? req.body
       : req.body?.templates;
-    const templates = await replaceEmailTemplates(getUserId(req), rawTemplates);
+    const templates = await replaceEmailTemplates(requireUserId(req), rawTemplates);
     res.json(templates);
   } catch (err) {
     next(err);
@@ -128,7 +128,7 @@ emailRouter.put('/templates', async (req, res, next) => {
 emailRouter.get('/labels', async (req, res, next) => {
   try {
     const labels = await listLabels(
-      getUserId(req),
+      requireUserId(req),
       asString(req.query.accountId, 'accountId')
     );
     res.json(labels);
@@ -139,7 +139,7 @@ emailRouter.get('/labels', async (req, res, next) => {
 
 emailRouter.get('/threads', async (req, res, next) => {
   try {
-    const result = await listThreads(getUserId(req), asString(req.query.accountId, 'accountId'), {
+    const result = await listThreads(requireUserId(req), asString(req.query.accountId, 'accountId'), {
       labelId: optionalString(req.query.labelId),
       pageToken: optionalString(req.query.pageToken),
       pageSize: req.query.pageSize ? Number(req.query.pageSize) : undefined,
@@ -154,7 +154,7 @@ emailRouter.get('/threads', async (req, res, next) => {
 emailRouter.get('/threads/:id', async (req, res, next) => {
   try {
     const thread = await getThread(
-      getUserId(req),
+      requireUserId(req),
       asString(req.query.accountId, 'accountId'),
       asString(req.params.id, 'id')
     );
@@ -167,7 +167,7 @@ emailRouter.get('/threads/:id', async (req, res, next) => {
 emailRouter.get('/messages/:id', async (req, res, next) => {
   try {
     const message = await getMessage(
-      getUserId(req),
+      requireUserId(req),
       asString(req.query.accountId, 'accountId'),
       asString(req.params.id, 'id')
     );
@@ -182,7 +182,7 @@ emailRouter.get(
   async (req: Request, res: Response, next) => {
     try {
       const base64 = await getAttachment(
-        getUserId(req),
+        requireUserId(req),
         asString(req.query.accountId, 'accountId'),
         asString(req.params.messageId, 'messageId'),
         asString(req.params.attachmentId, 'attachmentId')
@@ -198,7 +198,7 @@ emailRouter.get(
 
 emailRouter.post('/messages/send', async (req, res, next) => {
   try {
-    const result = await sendMessage(getUserId(req), asString(req.body.accountId, 'accountId'), {
+    const result = await sendMessage(requireUserId(req), asString(req.body.accountId, 'accountId'), {
       to: req.body.to,
       cc: req.body.cc,
       bcc: req.body.bcc,
@@ -214,7 +214,7 @@ emailRouter.post('/messages/send', async (req, res, next) => {
 emailRouter.post('/messages/:id/reply', async (req, res, next) => {
   try {
     const result = await replyMessage(
-      getUserId(req),
+      requireUserId(req),
       asString(req.body.accountId, 'accountId'),
       asString(req.params.id, 'id'),
       {
@@ -230,7 +230,7 @@ emailRouter.post('/messages/:id/reply', async (req, res, next) => {
 emailRouter.post('/messages/:id/reply-all', async (req, res, next) => {
   try {
     const result = await replyAllMessage(
-      getUserId(req),
+      requireUserId(req),
       asString(req.body.accountId, 'accountId'),
       asString(req.params.id, 'id'),
       {
@@ -246,7 +246,7 @@ emailRouter.post('/messages/:id/reply-all', async (req, res, next) => {
 emailRouter.post('/messages/:id/forward', async (req, res, next) => {
   try {
     const result = await forwardMessage(
-      getUserId(req),
+      requireUserId(req),
       asString(req.body.accountId, 'accountId'),
       asString(req.params.id, 'id'),
       {
@@ -263,7 +263,7 @@ emailRouter.post('/messages/:id/forward', async (req, res, next) => {
 emailRouter.patch('/messages/:id', async (req, res, next) => {
   try {
     const result = await modifyMessage(
-      getUserId(req),
+      requireUserId(req),
       asString(req.query.accountId, 'accountId'),
       asString(req.params.id, 'id'),
       {
@@ -280,7 +280,7 @@ emailRouter.patch('/messages/:id', async (req, res, next) => {
 emailRouter.post('/threads/batch-modify', async (req, res, next) => {
   try {
     const result = await batchModifyThreads(
-      getUserId(req),
+      requireUserId(req),
       asString(req.body.accountId, 'accountId'),
       Array.isArray(req.body.threadIds) ? req.body.threadIds : [],
       {
@@ -297,7 +297,7 @@ emailRouter.post('/threads/batch-modify', async (req, res, next) => {
 emailRouter.post('/threads/trash', async (req, res, next) => {
   try {
     const result = await trashThreads(
-      getUserId(req),
+      requireUserId(req),
       asString(req.body.accountId, 'accountId'),
       Array.isArray(req.body.threadIds) ? req.body.threadIds : []
     );

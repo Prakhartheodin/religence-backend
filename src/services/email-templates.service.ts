@@ -128,7 +128,7 @@ export async function listEmailTemplates(userId: string): Promise<EmailTemplateR
         updatedAt: now,
       },
     },
-    { upsert: true, new: true, lean: true }
+    { upsert: true, returnDocument: 'after', lean: true }
   );
 
   return cloneTemplates(doc?.templates ?? seededTemplates);
@@ -167,7 +167,7 @@ export async function replaceEmailTemplates(
         createdAt: now,
       },
     },
-    { upsert: true, new: true, lean: true }
+    { upsert: true, returnDocument: 'after', lean: true }
   );
 
   return cloneTemplates(saved?.templates ?? parsed);

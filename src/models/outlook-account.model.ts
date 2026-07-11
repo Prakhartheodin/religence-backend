@@ -9,6 +9,7 @@ const outlookAccountSchema = new mongoose.Schema<OutlookAccount>(
     userId: { type: String, required: true, index: true },
     provider: { type: String, required: true, enum: ['outlook'], default: 'outlook' },
     email: { type: String, required: true, lowercase: true, trim: true, index: true },
+    displayName: { type: String, default: null },
     accessToken: { type: String, required: true },
     refreshToken: { type: String, default: null },
     tokenExpiry: { type: String, default: null },

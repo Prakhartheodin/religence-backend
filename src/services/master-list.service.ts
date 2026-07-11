@@ -37,7 +37,7 @@ export async function replaceMasterList(
   const saved = await MasterListModel.findOneAndUpdate(
     { userId, kind },
     { $set: { items, updatedAt: now }, $setOnInsert: { userId, kind, createdAt: now } },
-    { upsert: true, new: true, lean: true }
+    { upsert: true, returnDocument: 'after', lean: true }
   );
   return saved?.items ?? items;
 }

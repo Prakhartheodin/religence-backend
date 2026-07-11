@@ -15,7 +15,7 @@ export async function replaceLeads(
   const saved = await LeadModel.findOneAndUpdate(
     { userId },
     { $set: { items, updatedAt: now }, $setOnInsert: { userId, createdAt: now } },
-    { upsert: true, new: true, lean: true }
+    { upsert: true, returnDocument: 'after', lean: true }
   );
   return saved?.items ?? items;
 }

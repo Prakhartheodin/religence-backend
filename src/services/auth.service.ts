@@ -55,6 +55,28 @@ export function verifyJwt(token: string): string {
   return payload.sub;
 }
 
+/** Short-lived token tying an Outlook OAuth flow to a specific JWT user. */
+export function issueOutlookConnectToken(userId: string): string {
+  return jwt.sign({ purpose: 'outlook-connect' }, secret(), {
+    subject: userId,
+    expiresIn: '10m',
+    issuer: 'religence-auth',
+    audience: 'religence-oauth',
+  });
+}
+
+export function verifyOutlookConnectToken(token: string): string {
+  const payload = jwt.verify(token, secret(), {
+    algorithms: ['HS256'],
+    issuer: 'religence-auth',
+    audience: 'religence-oauth',
+  }) as jwt.JwtPayload & { purpose?: string };
+  if (payload.purpose !== 'outlook-connect' || !payload.sub) {
+    throw new HttpError(401, 'invalid or expired connect token');
+  }
+  return payload.sub;
+}
+
 function requireStrong(password: string): void {
   if (password.length < 8 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) {
     throw new HttpError(422, 'password must be at least 8 characters with a letter and a number');
@@ -105,9 +127,25 @@ export async function register(
 }
 
 export function verifyEmail(raw: string): void {
-  const userId = store.consumeToken(tokenHash(raw || ''), 'verify');
-  if (!userId) throw new HttpError(400, 'invalid or expired verification token');
-  store.updateUser(userId, { emailVerified: true });
+  const trimmed = (raw || '').trim();
+  if (!trimmed) throw new HttpError(400, 'invalid or expired verification token');
+
+  const hash = tokenHash(trimmed);
+  const userId = store.consumeToken(hash, 'verify');
+  if (userId) {
+    store.updateUser(userId, { emailVerified: true });
+    store.recordConsumedVerify(hash, userId);
+    return;
+  }
+
+  // Idempotent retry when the token was already consumed (React Strict Mode, double-click).
+  const cachedUserId = store.findConsumedVerify(hash);
+  if (cachedUserId) {
+    const user = store.findById(cachedUserId);
+    if (user?.emailVerified) return;
+  }
+
+  throw new HttpError(400, 'invalid or expired verification token');
 }
 
 export async function resendVerification(email: string): Promise<void> {

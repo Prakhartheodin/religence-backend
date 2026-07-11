@@ -7,6 +7,7 @@ export interface OutlookAccount {
   userId: string;
   provider: EmailProvider;
   email: string;
+  displayName?: string | null;
   accessToken: string;
   refreshToken: string | null;
   tokenExpiry: string | null;
@@ -19,6 +20,7 @@ export interface EmailAccountPublic {
   id: string;
   provider: EmailProvider;
   email: string;
+  displayName?: string | null;
   status: AccountStatus;
   createdAt: string;
 }
