@@ -115,19 +115,12 @@ function parseTemplate(input: unknown, index: number): EmailTemplateRecord {
 }
 
 export async function listEmailTemplates(userId: string): Promise<EmailTemplateRecord[]> {
-  const now = new Date().toISOString();
   const seededTemplates = cloneTemplates(DEFAULT_EMAIL_TEMPLATES);
 
+  // createdAt/updatedAt are mongoose-managed (timestamps: true).
   const doc = await EmailTemplateSetModel.findOneAndUpdate(
     { userId },
-    {
-      $setOnInsert: {
-        userId,
-        templates: seededTemplates,
-        createdAt: now,
-        updatedAt: now,
-      },
-    },
+    { $setOnInsert: { userId, templates: seededTemplates } },
     { upsert: true, returnDocument: 'after', lean: true }
   );
 
@@ -154,20 +147,13 @@ export async function replaceEmailTemplates(
     dedup.add(tpl.id);
   }
 
-  const now = new Date().toISOString();
   const saved = await EmailTemplateSetModel.findOneAndUpdate(
     { userId },
     {
-      $set: {
-        templates: cloneTemplates(parsed),
-        updatedAt: now,
-      },
-      $setOnInsert: {
-        userId,
-        createdAt: now,
-      },
+      $set: { templates: cloneTemplates(parsed) },
+      $setOnInsert: { userId },
     },
-    { upsert: true, returnDocument: 'after', lean: true }
+    { upsert: true, returnDocument: 'after', lean: true, timestamps: true }
   );
 
   return cloneTemplates(saved?.templates ?? parsed);

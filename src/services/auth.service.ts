@@ -132,7 +132,7 @@ export async function register(
     passwordHash: hash,
     passwordSalt: salt,
     emailVerified: false,
-    createdAt: new Date().toISOString(),
+    createdAt: new Date(),
   });
   await sendVerification(user.email, await issueToken(user.userId, 'verify', VERIFY_TTL_MS));
 }

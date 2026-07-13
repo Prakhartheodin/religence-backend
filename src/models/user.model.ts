@@ -7,20 +7,20 @@ export type UserDoc = {
   passwordHash: string;
   passwordSalt: string;
   emailVerified: boolean;
-  createdAt: string;
+  createdAt: Date;
 };
 
 const userSchema = new mongoose.Schema(
   {
     userId: { type: String, required: true, unique: true },
-    email: { type: String, required: true, unique: true },
-    name: { type: String, required: true },
+    email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+    name: { type: String, required: true, trim: true },
     passwordHash: { type: String, required: true },
     passwordSalt: { type: String, required: true },
     emailVerified: { type: Boolean, default: false },
-    createdAt: { type: String, required: true },
+    createdAt: { type: Date, required: true, default: Date.now },
   },
-  { collection: 'users' }
+  { collection: 'users', versionKey: false }
 );
 
 export const UserModel = mongoose.models.User || mongoose.model('User', userSchema);

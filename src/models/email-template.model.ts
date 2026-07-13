@@ -4,8 +4,8 @@ import type { EmailTemplateRecord } from '../services/email-templates.service.js
 export type EmailTemplateSet = {
   userId: string;
   templates: EmailTemplateRecord[];
-  createdAt: string;
-  updatedAt: string;
+  createdAt: Date;
+  updatedAt: Date;
 };
 
 const templateSchema = new mongoose.Schema<EmailTemplateRecord>(
@@ -24,12 +24,11 @@ const emailTemplateSetSchema = new mongoose.Schema<EmailTemplateSet>(
   {
     userId: { type: String, required: true, unique: true, index: true },
     templates: { type: [templateSchema], required: true, default: [] },
-    createdAt: { type: String, required: true },
-    updatedAt: { type: String, required: true },
   },
   {
     collection: 'email_templates',
     versionKey: false,
+    timestamps: true, // real Dates, mongoose-managed (no business date here)
   }
 );
 

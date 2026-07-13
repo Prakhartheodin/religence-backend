@@ -1,7 +1,6 @@
 import { Router, type Request } from 'express';
 import { loadMasterData } from '../services/master-data.service.js';
-import { getMasterList, replaceMasterList } from '../services/master-list.service.js';
-import type { MasterListKind } from '../models/master-list.model.js';
+import { crmList } from '../services/crm-list.service.js';
 
 export const masterDataRouter = Router();
 
@@ -10,10 +9,13 @@ function uid(req: Request): string {
   return (req as Request & { userId?: string }).userId ?? '';
 }
 
-function registerListRoutes(kind: MasterListKind): void {
+// Salts/medicines are per-user lists like any CRM entity; same storage, same
+// GET/PUT contract. They keep their own collections rather than one keyed blob.
+for (const kind of ['salts', 'medicines'] as const) {
+  const service = crmList(kind);
   masterDataRouter.get(`/${kind}`, async (req, res, next) => {
     try {
-      res.json(await getMasterList(uid(req), kind));
+      res.json(await service.get(uid(req)));
     } catch (err) {
       next(err);
     }
@@ -21,15 +23,12 @@ function registerListRoutes(kind: MasterListKind): void {
   masterDataRouter.put(`/${kind}`, async (req, res, next) => {
     try {
       const items = Array.isArray(req.body) ? req.body : req.body?.items;
-      res.json(await replaceMasterList(uid(req), kind, items));
+      res.json(await service.replace(uid(req), items));
     } catch (err) {
       next(err);
     }
   });
 }
-
-registerListRoutes('salts');
-registerListRoutes('medicines');
 
 masterDataRouter.get('/', (req, res, next) => {
   try {

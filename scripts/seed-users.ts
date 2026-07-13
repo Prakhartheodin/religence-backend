@@ -15,8 +15,9 @@ type LegacyToken = {
   purpose: 'verify' | 'reset';
   expiresAt: number;
 };
+type LegacyUser = Omit<UserDoc, 'createdAt'> & { createdAt: string };
 type LegacyDB = {
-  users?: UserDoc[];
+  users?: LegacyUser[];
   tokens?: LegacyToken[];
   consumedVerify?: Record<string, { userId: string; consumedAt: number }>;
 };
@@ -38,7 +39,7 @@ void (async () => {
           passwordHash: u.passwordHash,
           passwordSalt: u.passwordSalt,
           emailVerified: u.emailVerified,
-          createdAt: u.createdAt,
+          createdAt: new Date(u.createdAt),
         },
       },
       { upsert: true }
