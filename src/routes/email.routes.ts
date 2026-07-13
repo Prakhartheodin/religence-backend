@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import config from '../config.js';
 import { HttpError } from '../http-error.js';
+import { buildFrontendUrl } from '../lib/normalize-url.js';
 import { requireAuth } from '../middleware/require-auth.js';
 import { verifyOutlookConnectToken } from '../services/auth.service.js';
 import {
@@ -73,14 +74,18 @@ emailRouter.get('/auth/microsoft/callback', async (req, res, next) => {
     const code = asString(req.query.code, 'code');
     const state = asString(req.query.state, 'state');
     const account = await handleMicrosoftCallback(code, state);
-    const successUrl = new URL('/inbox', config.corsOrigin);
-    successUrl.searchParams.set('outlook_connected', account.email);
-    res.redirect(successUrl.toString());
+    res.redirect(
+      buildFrontendUrl(config.appBaseUrl, '/inbox', {
+        outlook_connected: account.email,
+      })
+    );
   } catch (err) {
     if (err instanceof HttpError) {
-      const errorUrl = new URL('/inbox', config.corsOrigin);
-      errorUrl.searchParams.set('outlook_error', err.message);
-      return res.redirect(errorUrl.toString());
+      return res.redirect(
+        buildFrontendUrl(config.appBaseUrl, '/inbox', {
+          outlook_error: err.message,
+        })
+      );
     }
     next(err);
   }

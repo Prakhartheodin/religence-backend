@@ -1,14 +1,16 @@
 import dotenv from 'dotenv';
+import { normalizeBaseUrl } from './lib/normalize-url.js';
 
 dotenv.config();
 
 const port = Number(process.env.PORT ?? 4000);
+const localDefault = 'http://localhost:3000';
 
 export const config = {
   env: process.env.NODE_ENV ?? 'development',
   port,
-  corsOrigin: process.env.CORS_ORIGIN ?? 'http://localhost:3000',
-  appBaseUrl: process.env.APP_BASE_URL ?? 'http://localhost:3000',
+  corsOrigin: normalizeBaseUrl(process.env.CORS_ORIGIN, localDefault),
+  appBaseUrl: normalizeBaseUrl(process.env.APP_BASE_URL, localDefault),
   mongodbUri: (process.env.MONGODB_URI ?? '').trim(),
   masterDataExcelDir: (process.env.MASTER_DATA_EXCEL_DIR ?? '').trim(),
   jwtSecret: process.env.AUTH_JWT_SECRET ?? '',
