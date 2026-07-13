@@ -12,6 +12,9 @@ import { connectMongo } from '../src/db/mongo.js';
 const apply = process.argv.includes('--apply');
 const BACKUP_DB = 'religence_prenorm_backup';
 
+// Deliberately excludes salts/medicines/master_lists: those are now a shared
+// catalogue with no userId, and restoring the old per-user shape over it would
+// re-create the exact duplication migrate-shared-catalogue.ts removed.
 const CRM_COLLECTIONS = [
   'leads',
   'contacts',
@@ -19,9 +22,6 @@ const CRM_COLLECTIONS = [
   'deals',
   'crm_timeline',
   'crm_emails',
-  'master_lists',
-  'salts',
-  'medicines',
 ];
 
 void (async () => {

@@ -168,19 +168,9 @@ export const CrmEntities = {
     },
   }),
 
-  salts: entityModel('Salt', {
-    collection: 'salts',
-    fields: { name: { type: String, default: '' } },
-  }),
-
-  medicines: entityModel('Medicine', {
-    collection: 'medicines',
-    fields: {
-      saltId: { type: String, default: '' },
-      name: { type: String, default: '' },
-      dosageForm: { type: String, default: '' },
-    },
-  }),
+  // Salts and medicines are NOT here: they are a shared catalogue, not per-user
+  // lists. See models/catalogue.ts. Routing them through this per-user machinery
+  // is what gave every user a private copy of the same 10 rows.
 } as const;
 
 export type CrmEntityName = keyof typeof CrmEntities;

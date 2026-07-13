@@ -40,11 +40,9 @@ void (async () => {
       work.push({ entity, userId: b.userId, items: b.items ?? [] });
     }
   }
-  for (const b of (await db.collection('master_lists').find({}).toArray()) as unknown as Blob[]) {
-    if (b.kind === 'salts' || b.kind === 'medicines') {
-      work.push({ entity: b.kind, userId: b.userId, items: b.items ?? [] });
-    }
-  }
+  // Salts/medicines used to be normalised here as per-user CRM entities. They are
+  // now a shared catalogue with no owner — see scripts/migrate-shared-catalogue.ts.
+  // `master_lists` is empty (0 docs) and is dropped, not migrated.
 
   const totals: Record<string, number> = {};
   for (const w of work) totals[w.entity] = (totals[w.entity] ?? 0) + w.items.length;
