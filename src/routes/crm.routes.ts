@@ -1,9 +1,5 @@
 import { Router, type Request } from 'express';
-import { getContacts, replaceContacts } from '../services/contact.service.js';
-import { getCompanies, replaceCompanies } from '../services/company.service.js';
-import { getLeads, replaceLeads } from '../services/lead.service.js';
-import { getDeals, replaceDeals } from '../services/deal.service.js';
-import { getTimeline, replaceTimeline } from '../services/timeline.service.js';
+import { crmList } from '../services/crm-list.service.js';
 
 export const crmRouter = Router();
 
@@ -12,14 +8,18 @@ function uid(req: Request): string {
   return (req as Request & { userId?: string }).userId ?? '';
 }
 
-type ListService = {
-  get: (userId: string) => Promise<Record<string, unknown>[]>;
-  replace: (userId: string, input: unknown) => Promise<Record<string, unknown>[]>;
+// path -> [mongoose model name, collection]. Adding an entity is one line.
+const ENTITIES: Record<string, [string, string]> = {
+  contacts: ['Contact', 'contacts'],
+  companies: ['Company', 'companies'],
+  leads: ['Lead', 'leads'],
+  deals: ['Deal', 'deals'],
+  timeline: ['Timeline', 'crm_timeline'],
+  emails: ['Email', 'crm_emails'],
 };
 
-// Each entity keeps its own model + service; the router just exposes them
-// under a consistent GET/PUT /v1/crm/<entity> surface.
-function registerEntity(path: string, service: ListService): void {
+for (const [path, [name, collection]] of Object.entries(ENTITIES)) {
+  const service = crmList(name, collection);
   crmRouter.get(`/${path}`, async (req, res, next) => {
     try {
       res.json(await service.get(uid(req)));
@@ -36,9 +36,3 @@ function registerEntity(path: string, service: ListService): void {
     }
   });
 }
-
-registerEntity('contacts', { get: getContacts, replace: replaceContacts });
-registerEntity('companies', { get: getCompanies, replace: replaceCompanies });
-registerEntity('leads', { get: getLeads, replace: replaceLeads });
-registerEntity('deals', { get: getDeals, replace: replaceDeals });
-registerEntity('timeline', { get: getTimeline, replace: replaceTimeline });

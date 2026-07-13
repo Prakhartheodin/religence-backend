@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { OutlookAccountModel } from '../models/outlook-account.model.js';
-import type { AccountStatus, EmailAccountPublic, OutlookAccount } from '../types/email.js';
+import type { AccountStatus, OutlookAccount } from '../types/email.js';
 
 function toOutlookAccount(doc: Partial<OutlookAccount> | null | undefined): OutlookAccount | null {
   if (!doc || !doc.id || !doc.userId || !doc.email) return null;
@@ -26,28 +26,6 @@ function toOutlookAccount(doc: Partial<OutlookAccount> | null | undefined): Outl
     createdAt: String(doc.createdAt ?? ''),
     updatedAt: String(doc.updatedAt ?? ''),
   };
-}
-
-export async function listOutlookAccountsByUser(userId: string): Promise<EmailAccountPublic[]> {
-  const docs = await OutlookAccountModel.find({
-    userId,
-    provider: 'outlook',
-    status: 'active',
-  })
-    .sort({ updatedAt: -1 })
-    .lean();
-
-  return docs
-    .map((doc) => toOutlookAccount(doc))
-    .filter((a): a is OutlookAccount => Boolean(a))
-    .map((a) => ({
-      id: a.id,
-      provider: a.provider,
-      email: a.email,
-      displayName: a.displayName ?? null,
-      status: a.status,
-      createdAt: a.createdAt,
-    }));
 }
 
 export async function findOutlookAccountById(
