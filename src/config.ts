@@ -11,12 +11,17 @@ export const config = {
   demoUserId: process.env.DEMO_USER_ID ?? 'demo-user',
   appBaseUrl: process.env.APP_BASE_URL ?? 'http://localhost:3000',
   mongodbUri: (process.env.MONGODB_URI ?? '').trim(),
-  storageConnectionString: (process.env.STORAGE_CONNECTION_STRING ?? '').trim(),
   masterDataExcelDir: (process.env.MASTER_DATA_EXCEL_DIR ?? '').trim(),
   jwtSecret: process.env.AUTH_JWT_SECRET ?? '',
   smtp: {
-    url: process.env.SMTP_URL ?? '', // e.g. smtp://user:pass@smtp.example.com:587
-    from: process.env.AUTH_EMAIL_FROM ?? 'Religence <no-reply@religence.local>',
+    host: (process.env.SMTP_HOST ?? '').trim(),
+    port: Number(process.env.SMTP_PORT ?? 465),
+    // Seconds. Gmail on a cold connection needs a few; keep it short so a bad
+    // host fails fast instead of hanging the register/reset request.
+    timeoutS: Number(process.env.SMTP_TIMEOUT ?? 10),
+    user: process.env.SMTP_USERNAME ?? '',
+    pass: process.env.SMTP_PASSWORD ?? '',
+    from: process.env.EMAIL_FROM ?? 'Religence <no-reply@religence.local>',
   },
   microsoft: {
     clientId: process.env.MICROSOFT_CLIENT_ID ?? '',

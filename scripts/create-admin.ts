@@ -3,7 +3,7 @@
 import 'dotenv/config';
 import { randomBytes } from 'node:crypto';
 
-process.env.SMTP_URL = ''; // console mode — no email sent for the seed
+process.env.SMTP_HOST = ''; // console mode — no email sent for the seed
 
 const email = process.argv[2] ?? 'admin@religence.local';
 const password = process.argv[3] ?? `${randomBytes(6).toString('base64url')}A1`;

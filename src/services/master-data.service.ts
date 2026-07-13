@@ -61,7 +61,7 @@ let cache: {
 } | null = null;
 
 function resolveExcelDirectory(): string {
-  const fromEnv = config.storageConnectionString || config.masterDataExcelDir;
+  const fromEnv = config.masterDataExcelDir;
   if (fromEnv) {
     return path.isAbsolute(fromEnv)
       ? path.normalize(fromEnv)

@@ -1,8 +1,19 @@
 import nodemailer from 'nodemailer';
 import config from '../config.js';
 
-// ponytail: console fallback when SMTP_URL is unset — dev needs no mail server.
-const transport = config.smtp.url ? nodemailer.createTransport(config.smtp.url) : null;
+// ponytail: console fallback when SMTP_HOST is unset — dev needs no mail server.
+const timeoutMs = config.smtp.timeoutS * 1000;
+const transport = config.smtp.host
+  ? nodemailer.createTransport({
+      host: config.smtp.host,
+      port: config.smtp.port,
+      secure: config.smtp.port === 465, // implicit TLS on 465, STARTTLS otherwise
+      auth: { user: config.smtp.user, pass: config.smtp.pass },
+      connectionTimeout: timeoutMs,
+      greetingTimeout: timeoutMs,
+      socketTimeout: timeoutMs,
+    })
+  : null;
 
 type EmailPayload = { to: string; subject: string; html: string; text: string };
 
