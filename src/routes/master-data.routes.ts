@@ -1,8 +1,12 @@
-import { Router } from 'express';
+import { Router, type Request } from 'express';
 import * as catalogue from '../services/catalogue.service.js';
 import { loadMasterData } from '../services/master-data.service.js';
 
 export const masterDataRouter = Router();
+
+// requireAuth (mounted in index.ts) sets req.userId; used as the change-log actor.
+const uid = (req: Request): string =>
+  (req as Request & { userId?: string }).userId ?? '';
 
 /**
  * The salt/medicine catalogue is a single SHARED table — no userId, one row per
@@ -28,7 +32,7 @@ masterDataRouter.get('/salts', async (_req, res, next) => {
 
 masterDataRouter.post('/salts', async (req, res, next) => {
   try {
-    res.status(201).json(await catalogue.createSalt(req.body ?? {}));
+    res.status(201).json(await catalogue.createSalt(req.body ?? {}, uid(req)));
   } catch (err) {
     next(err);
   }
@@ -36,7 +40,7 @@ masterDataRouter.post('/salts', async (req, res, next) => {
 
 masterDataRouter.patch('/salts/:id', async (req, res, next) => {
   try {
-    res.json(await catalogue.updateSalt(req.params.id, req.body ?? {}));
+    res.json(await catalogue.updateSalt(req.params.id, req.body ?? {}, uid(req)));
   } catch (err) {
     next(err);
   }
@@ -44,7 +48,7 @@ masterDataRouter.patch('/salts/:id', async (req, res, next) => {
 
 masterDataRouter.delete('/salts/:id', async (req, res, next) => {
   try {
-    await catalogue.deleteSalt(req.params.id);
+    await catalogue.deleteSalt(req.params.id, uid(req));
     res.status(204).end();
   } catch (err) {
     next(err);
@@ -61,7 +65,7 @@ masterDataRouter.get('/medicines', async (_req, res, next) => {
 
 masterDataRouter.post('/medicines', async (req, res, next) => {
   try {
-    res.status(201).json(await catalogue.createMedicine(req.body ?? {}));
+    res.status(201).json(await catalogue.createMedicine(req.body ?? {}, uid(req)));
   } catch (err) {
     next(err);
   }
@@ -69,7 +73,7 @@ masterDataRouter.post('/medicines', async (req, res, next) => {
 
 masterDataRouter.patch('/medicines/:id', async (req, res, next) => {
   try {
-    res.json(await catalogue.updateMedicine(req.params.id, req.body ?? {}));
+    res.json(await catalogue.updateMedicine(req.params.id, req.body ?? {}, uid(req)));
   } catch (err) {
     next(err);
   }
@@ -77,7 +81,7 @@ masterDataRouter.patch('/medicines/:id', async (req, res, next) => {
 
 masterDataRouter.delete('/medicines/:id', async (req, res, next) => {
   try {
-    await catalogue.deleteMedicine(req.params.id);
+    await catalogue.deleteMedicine(req.params.id, uid(req));
     res.status(204).end();
   } catch (err) {
     next(err);

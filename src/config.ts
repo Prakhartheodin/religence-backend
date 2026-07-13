@@ -12,6 +12,7 @@ export const config = {
   mongodbUri: (process.env.MONGODB_URI ?? '').trim(),
   masterDataExcelDir: (process.env.MASTER_DATA_EXCEL_DIR ?? '').trim(),
   jwtSecret: process.env.AUTH_JWT_SECRET ?? '',
+  tokenEncKey: (process.env.TOKEN_ENC_KEY ?? '').trim(),
   smtp: {
     host: (process.env.SMTP_HOST ?? '').trim(),
     port: Number(process.env.SMTP_PORT ?? 465),

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { OutlookAccountModel } from '../models/outlook-account.model.js';
+import { decryptToken, encryptToken } from './token-crypto.js';
 import type { AccountStatus, OutlookAccount } from '../types/email.js';
 
 function toOutlookAccount(doc: Partial<OutlookAccount> | null | undefined): OutlookAccount | null {
@@ -13,11 +14,11 @@ function toOutlookAccount(doc: Partial<OutlookAccount> | null | undefined): Outl
       doc.displayName === null || doc.displayName === undefined
         ? null
         : String(doc.displayName).trim() || null,
-    accessToken: String(doc.accessToken ?? ''),
+    accessToken: decryptToken(String(doc.accessToken ?? '')) ?? '',
     refreshToken:
       doc.refreshToken === null || doc.refreshToken === undefined
         ? null
-        : String(doc.refreshToken),
+        : decryptToken(String(doc.refreshToken)),
     tokenExpiry:
       doc.tokenExpiry === null || doc.tokenExpiry === undefined
         ? null
@@ -93,8 +94,8 @@ export async function upsertOutlookAccount(input: {
         $set: {
           email,
           displayName: displayName ?? existing.displayName ?? null,
-          accessToken: input.accessToken,
-          refreshToken: input.refreshToken,
+          accessToken: encryptToken(input.accessToken) ?? '',
+          refreshToken: encryptToken(input.refreshToken),
           tokenExpiry: input.tokenExpiry,
           status: 'active',
           updatedAt: now,
@@ -120,7 +121,12 @@ export async function upsertOutlookAccount(input: {
     createdAt: now,
     updatedAt: now,
   };
-  await OutlookAccountModel.create(created);
+  // Persist encrypted; hand the caller back the plaintext tokens it passed in.
+  await OutlookAccountModel.create({
+    ...created,
+    accessToken: encryptToken(created.accessToken) ?? '',
+    refreshToken: encryptToken(created.refreshToken),
+  });
   return created;
 }
 
@@ -129,11 +135,14 @@ export async function updateOutlookAccount(
   accountId: string,
   patch: Partial<OutlookAccount>
 ): Promise<OutlookAccount | null> {
+  const encrypted = { ...patch };
+  if ('accessToken' in encrypted) encrypted.accessToken = encryptToken(encrypted.accessToken ?? '') ?? '';
+  if ('refreshToken' in encrypted) encrypted.refreshToken = encryptToken(encrypted.refreshToken ?? null);
   const updated = await OutlookAccountModel.findOneAndUpdate(
     { id: accountId, userId, provider: 'outlook' },
     {
       $set: {
-        ...patch,
+        ...encrypted,
         updatedAt: new Date().toISOString(),
       },
     },

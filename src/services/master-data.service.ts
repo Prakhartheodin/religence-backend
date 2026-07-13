@@ -128,7 +128,10 @@ function listSourceFiles(excelDir: string): string[] {
     );
   }
   const files = readdirSync(excelDir)
-    .filter((name) => /\.(xlsx|xls|csv)$/i.test(name))
+    // `~$Foo.xlsx` is the lock file Excel writes while a workbook is open. It
+    // ends in .xlsx but has no data — skip it, or a user opening a source file
+    // 500s this whole endpoint.
+    .filter((name) => /\.(xlsx|xls|csv)$/i.test(name) && !name.startsWith('~$'))
     .sort((a, b) => a.localeCompare(b));
 
   if (!files.length) {
@@ -446,8 +449,19 @@ export function loadMasterData(forceReload = false): MasterDataModel {
   const allRows: CanonicalRow[] = [];
   for (const file of files) {
     const filePath = path.join(excelDir, file);
-    const rows = parseWorkbookRows(filePath, file);
-    allRows.push(...rows);
+    try {
+      allRows.push(...parseWorkbookRows(filePath, file));
+    } catch (err) {
+      // A single corrupt/malformed file must not take down the whole catalogue.
+      // Skip it and keep loading the rest; the zero-rows guard below still fires
+      // if every file is bad.
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[religence-backend] Skipping master file "${file}": ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
   }
 
   if (!allRows.length) {

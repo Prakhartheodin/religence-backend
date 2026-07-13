@@ -30,7 +30,10 @@ for (const entity of ENTITIES) {
   crmRouter.put(`/${entity}`, async (req, res, next) => {
     try {
       const items = Array.isArray(req.body) ? req.body : req.body?.items;
-      res.json(await service.replace(uid(req), items));
+      const baseIds = Array.isArray(req.body?.baseIds)
+        ? (req.body.baseIds as unknown[]).map(String)
+        : null;
+      res.json(await service.replace(uid(req), items, baseIds));
     } catch (err) {
       next(err);
     }

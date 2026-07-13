@@ -1,4 +1,4 @@
-import { createHash, pbkdf2Sync, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, pbkdf2Sync, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import config from '../config.js';
 import { HttpError } from '../http-error.js';
@@ -25,7 +25,11 @@ function hashPassword(password: string, salt = randomBytes(16).toString('hex')):
 }
 
 function verifyPassword(password: string, hash: string, salt: string): boolean {
-  return hashPassword(password, salt).hash === hash;
+  const computed = Buffer.from(hashPassword(password, salt).hash, 'base64');
+  const stored = Buffer.from(hash, 'base64');
+  // timingSafeEqual throws on length mismatch; a wrong-length stored hash is a
+  // non-match, not a crash.
+  return computed.length === stored.length && timingSafeEqual(computed, stored);
 }
 
 const tokenHash = (raw: string): string => createHash('sha256').update(raw).digest('hex');

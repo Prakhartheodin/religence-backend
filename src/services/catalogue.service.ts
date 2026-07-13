@@ -1,5 +1,6 @@
 import { HttpError } from '../http-error.js';
 import { MedicineCatalogue, SaltCatalogue } from '../models/catalogue.js';
+import { recordChanges } from './change-log.service.js';
 
 /**
  * Shared salt/medicine catalogue. Per-item writes only.
@@ -19,19 +20,25 @@ export async function listSalts(): Promise<Record<string, unknown>[]> {
   return docs.map((d) => d.toJSON());
 }
 
-export async function createSalt(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+export async function createSalt(
+  body: Record<string, unknown>,
+  actorUserId = ''
+): Promise<Record<string, unknown>> {
   const id = str(body.id);
   const name = str(body.name);
   if (!id) throw new HttpError(400, 'id is required');
   if (!name) throw new HttpError(400, 'name is required');
   if (await SaltCatalogue.exists({ id })) throw new HttpError(409, `salt ${id} already exists`);
   const doc = await SaltCatalogue.create({ id, name });
-  return doc.toJSON();
+  const json = doc.toJSON();
+  await recordChanges([{ actorUserId, entity: 'salts', docId: id, op: 'create', before: null, after: json }]);
+  return json;
 }
 
 export async function updateSalt(
   id: string,
-  body: Record<string, unknown>
+  body: Record<string, unknown>,
+  actorUserId = ''
 ): Promise<Record<string, unknown>> {
   const set: Record<string, string> = {};
   if (body.name !== undefined) {
@@ -39,23 +46,33 @@ export async function updateSalt(
     if (!name) throw new HttpError(400, 'name cannot be empty');
     set.name = name;
   }
+  const before = await SaltCatalogue.findOne({ id });
+  if (!before) throw new HttpError(404, `salt ${id} not found`);
   const doc = await SaltCatalogue.findOneAndUpdate(
     { id },
     { $set: set },
     { returnDocument: 'after', runValidators: true }
   );
   if (!doc) throw new HttpError(404, `salt ${id} not found`);
-  return doc.toJSON();
+  const json = doc.toJSON();
+  await recordChanges([
+    { actorUserId, entity: 'salts', docId: id, op: 'update', before: before.toJSON(), after: json },
+  ]);
+  return json;
 }
 
-export async function deleteSalt(id: string): Promise<void> {
+export async function deleteSalt(id: string, actorUserId = ''): Promise<void> {
   // The only referential link in the catalogue. Leads point at salts by NAME,
   // not id, so there is nothing else to check.
   if (await MedicineCatalogue.exists({ saltId: id })) {
     throw new HttpError(409, 'salt has linked medicines');
   }
-  const res = await SaltCatalogue.deleteOne({ id });
-  if (!res.deletedCount) throw new HttpError(404, `salt ${id} not found`);
+  const before = await SaltCatalogue.findOne({ id });
+  if (!before) throw new HttpError(404, `salt ${id} not found`);
+  await SaltCatalogue.deleteOne({ id });
+  await recordChanges([
+    { actorUserId, entity: 'salts', docId: id, op: 'delete', before: before.toJSON(), after: null },
+  ]);
 }
 
 export async function listMedicines(): Promise<Record<string, unknown>[]> {
@@ -64,7 +81,8 @@ export async function listMedicines(): Promise<Record<string, unknown>[]> {
 }
 
 export async function createMedicine(
-  body: Record<string, unknown>
+  body: Record<string, unknown>,
+  actorUserId = ''
 ): Promise<Record<string, unknown>> {
   const id = str(body.id);
   const name = str(body.name);
@@ -80,12 +98,17 @@ export async function createMedicine(
     throw new HttpError(409, `medicine ${id} already exists`);
   }
   const doc = await MedicineCatalogue.create({ id, saltId, name, dosageForm });
-  return doc.toJSON();
+  const json = doc.toJSON();
+  await recordChanges([
+    { actorUserId, entity: 'medicines', docId: id, op: 'create', before: null, after: json },
+  ]);
+  return json;
 }
 
 export async function updateMedicine(
   id: string,
-  body: Record<string, unknown>
+  body: Record<string, unknown>,
+  actorUserId = ''
 ): Promise<Record<string, unknown>> {
   const set: Record<string, string> = {};
   if (body.name !== undefined) {
@@ -101,16 +124,26 @@ export async function updateMedicine(
     }
     set.saltId = saltId;
   }
+  const before = await MedicineCatalogue.findOne({ id });
+  if (!before) throw new HttpError(404, `medicine ${id} not found`);
   const doc = await MedicineCatalogue.findOneAndUpdate(
     { id },
     { $set: set },
     { returnDocument: 'after', runValidators: true }
   );
   if (!doc) throw new HttpError(404, `medicine ${id} not found`);
-  return doc.toJSON();
+  const json = doc.toJSON();
+  await recordChanges([
+    { actorUserId, entity: 'medicines', docId: id, op: 'update', before: before.toJSON(), after: json },
+  ]);
+  return json;
 }
 
-export async function deleteMedicine(id: string): Promise<void> {
-  const res = await MedicineCatalogue.deleteOne({ id });
-  if (!res.deletedCount) throw new HttpError(404, `medicine ${id} not found`);
+export async function deleteMedicine(id: string, actorUserId = ''): Promise<void> {
+  const before = await MedicineCatalogue.findOne({ id });
+  if (!before) throw new HttpError(404, `medicine ${id} not found`);
+  await MedicineCatalogue.deleteOne({ id });
+  await recordChanges([
+    { actorUserId, entity: 'medicines', docId: id, op: 'delete', before: before.toJSON(), after: null },
+  ]);
 }
