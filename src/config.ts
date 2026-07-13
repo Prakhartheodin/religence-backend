@@ -8,7 +8,6 @@ export const config = {
   env: process.env.NODE_ENV ?? 'development',
   port,
   corsOrigin: process.env.CORS_ORIGIN ?? 'http://localhost:3000',
-  demoUserId: process.env.DEMO_USER_ID ?? 'demo-user',
   appBaseUrl: process.env.APP_BASE_URL ?? 'http://localhost:3000',
   mongodbUri: (process.env.MONGODB_URI ?? '').trim(),
   masterDataExcelDir: (process.env.MASTER_DATA_EXCEL_DIR ?? '').trim(),
