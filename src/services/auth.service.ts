@@ -30,9 +30,18 @@ function verifyPassword(password: string, hash: string, salt: string): boolean {
 
 const tokenHash = (raw: string): string => createHash('sha256').update(raw).digest('hex');
 
-function issueToken(userId: string, purpose: 'verify' | 'reset', ttlMs: number): string {
+async function issueToken(
+  userId: string,
+  purpose: 'verify' | 'reset',
+  ttlMs: number
+): Promise<string> {
   const raw = randomBytes(32).toString('base64url');
-  store.addToken({ tokenHash: tokenHash(raw), userId, purpose, expiresAt: Date.now() + ttlMs });
+  await store.addToken({
+    tokenHash: tokenHash(raw),
+    userId,
+    purpose,
+    expiresAt: new Date(Date.now() + ttlMs),
+  });
   return raw;
 }
 
@@ -112,9 +121,11 @@ export async function register(
   if (password !== confirmPassword) throw new HttpError(422, 'password and confirm password must match');
   if (!EMAIL_RE.test(email.trim())) throw new HttpError(422, 'invalid email address');
   requireStrong(password);
-  if (store.findByEmail(email)) throw new HttpError(409, 'an account with this email already exists');
+  if (await store.findByEmail(email)) {
+    throw new HttpError(409, 'an account with this email already exists');
+  }
   const { hash, salt } = hashPassword(password);
-  const user = store.createUser({
+  const user = await store.createUser({
     userId: `usr-${randomUUID()}`,
     email: email.trim().toLowerCase(),
     name: cleanName,
@@ -123,25 +134,25 @@ export async function register(
     emailVerified: false,
     createdAt: new Date().toISOString(),
   });
-  await sendVerification(user.email, issueToken(user.userId, 'verify', VERIFY_TTL_MS));
+  await sendVerification(user.email, await issueToken(user.userId, 'verify', VERIFY_TTL_MS));
 }
 
-export function verifyEmail(raw: string): void {
+export async function verifyEmail(raw: string): Promise<void> {
   const trimmed = (raw || '').trim();
   if (!trimmed) throw new HttpError(400, 'invalid or expired verification token');
 
   const hash = tokenHash(trimmed);
-  const userId = store.consumeToken(hash, 'verify');
+  const userId = await store.consumeToken(hash, 'verify');
   if (userId) {
-    store.updateUser(userId, { emailVerified: true });
-    store.recordConsumedVerify(hash, userId);
+    await store.updateUser(userId, { emailVerified: true });
+    await store.recordConsumedVerify(hash, userId);
     return;
   }
 
   // Idempotent retry when the token was already consumed (React Strict Mode, double-click).
-  const cachedUserId = store.findConsumedVerify(hash);
+  const cachedUserId = await store.findConsumedVerify(hash);
   if (cachedUserId) {
-    const user = store.findById(cachedUserId);
+    const user = await store.findById(cachedUserId);
     if (user?.emailVerified) return;
   }
 
@@ -149,14 +160,17 @@ export function verifyEmail(raw: string): void {
 }
 
 export async function resendVerification(email: string): Promise<void> {
-  const user = store.findByEmail(email);
+  const user = await store.findByEmail(email);
   if (!user || user.emailVerified) return; // no enumeration
-  await sendVerification(user.email, issueToken(user.userId, 'verify', VERIFY_TTL_MS));
+  await sendVerification(user.email, await issueToken(user.userId, 'verify', VERIFY_TTL_MS));
 }
 
-export function login(email: string, password: string): { token: string; user: object } {
+export async function login(
+  email: string,
+  password: string
+): Promise<{ token: string; user: object }> {
   throttle(`login:${email.trim().toLowerCase()}`, 5, 15 * 60 * 1000);
-  const user = store.findByEmail(email);
+  const user = await store.findByEmail(email);
   if (!user || !verifyPassword(password, user.passwordHash, user.passwordSalt)) {
     throw new HttpError(401, 'invalid email or password');
   }
@@ -170,15 +184,15 @@ export function login(email: string, password: string): { token: string; user: o
 }
 
 export async function forgotPassword(email: string): Promise<void> {
-  const user = store.findByEmail(email);
+  const user = await store.findByEmail(email);
   if (!user) return; // no enumeration
-  await sendPasswordReset(user.email, issueToken(user.userId, 'reset', RESET_TTL_MS));
+  await sendPasswordReset(user.email, await issueToken(user.userId, 'reset', RESET_TTL_MS));
 }
 
-export function resetPassword(raw: string, newPassword: string): void {
+export async function resetPassword(raw: string, newPassword: string): Promise<void> {
   requireStrong(newPassword);
-  const userId = store.consumeToken(tokenHash(raw || ''), 'reset');
+  const userId = await store.consumeToken(tokenHash(raw || ''), 'reset');
   if (!userId) throw new HttpError(400, 'invalid or expired reset token');
   const { hash, salt } = hashPassword(newPassword);
-  store.updateUser(userId, { passwordHash: hash, passwordSalt: salt });
+  await store.updateUser(userId, { passwordHash: hash, passwordSalt: salt });
 }

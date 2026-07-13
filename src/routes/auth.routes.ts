@@ -19,18 +19,18 @@ authRouter.post('/register', async (req, res, next) => {
   }
 });
 
-authRouter.post('/verify', (req, res, next) => {
+authRouter.post('/verify', async (req, res, next) => {
   try {
-    auth.verifyEmail(str(req.body.token));
+    await auth.verifyEmail(str(req.body.token));
     res.json({ status: 'verified' });
   } catch (err) {
     next(err);
   }
 });
 
-authRouter.post('/login', (req, res, next) => {
+authRouter.post('/login', async (req, res, next) => {
   try {
-    res.json(auth.login(str(req.body.email), String(req.body.password ?? '')));
+    res.json(await auth.login(str(req.body.email), String(req.body.password ?? '')));
   } catch (err) {
     next(err);
   }
@@ -54,9 +54,9 @@ authRouter.post('/forgot-password', async (req, res, next) => {
   }
 });
 
-authRouter.post('/reset-password', (req, res, next) => {
+authRouter.post('/reset-password', async (req, res, next) => {
   try {
-    auth.resetPassword(str(req.body.token), String(req.body.password ?? ''));
+    await auth.resetPassword(str(req.body.token), String(req.body.password ?? ''));
     res.json({ status: 'ok' });
   } catch (err) {
     next(err);
