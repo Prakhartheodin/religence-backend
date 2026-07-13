@@ -1,6 +1,6 @@
 import { Router, type Request } from 'express';
 import * as catalogue from '../services/catalogue.service.js';
-import { loadMasterData } from '../services/master-data.service.js';
+import { clearMasterDataCache, loadMasterData } from '../services/master-data.service.js';
 
 export const masterDataRouter = Router();
 
@@ -88,21 +88,22 @@ masterDataRouter.delete('/medicines/:id', async (req, res, next) => {
   }
 });
 
-// The Excel-derived buyer catalogue. Lead Discovery joins buyers against the
-// deterministic salt-<slug> / med-<slug> ids, so these must stay in step with the
-// rows above.
-masterDataRouter.get('/', (req, res, next) => {
+// Buyers live in MongoDB (seeded from Excel via scripts/seed-buyers-from-excel.mts).
+// Lead Discovery joins buyers against the deterministic salt-<slug> / med-<slug> ids.
+masterDataRouter.get('/', async (req, res, next) => {
   try {
     const forceReload = String(req.query.reload || '').toLowerCase() === 'true';
-    res.json(loadMasterData(forceReload));
+    if (forceReload) clearMasterDataCache();
+    res.json(await loadMasterData(forceReload));
   } catch (err) {
     next(err);
   }
 });
 
-masterDataRouter.post('/reload', (_req, res, next) => {
+masterDataRouter.post('/reload', async (_req, res, next) => {
   try {
-    res.json(loadMasterData(true));
+    clearMasterDataCache();
+    res.json(await loadMasterData(true));
   } catch (err) {
     next(err);
   }

@@ -1,11 +1,14 @@
 /**
- * Verifies salts, medicines, and buyers imported from Excel match source files.
+ * Verifies buyers in MongoDB match Excel source files.
  * Run: npx tsx scripts/verify-master-data.ts
  */
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
+import mongoose from 'mongoose';
 import { read, utils } from 'xlsx';
-import { loadMasterData } from '../src/services/master-data.service.js';
+import config from '../src/config.js';
+import { buildMasterDataFromBuyers, parseExcelDirectory, resolveExcelDirectory } from '../src/lib/excel-master-data.js';
+import { listBuyers } from '../src/services/buyer.service.js';
 import type { BuyerMasterModel } from '../src/types/master-data.js';
 
 type RawRow = {
@@ -19,8 +22,8 @@ type RawRow = {
   annualBuyingCapacityKg: number | null;
   contactPersons: string[];
   designations: string[];
-  emails: string[];
   phoneNumbers: string[];
+  emails: string[];
   country: string | null;
 };
 
@@ -207,36 +210,45 @@ function buyerMatchesExcel(buyer: BuyerMasterModel, excel: RawRow): string[] {
   ];
   for (const [field, actual, expected] of checks) {
     if (actual !== expected) {
-      mismatches.push(`${field}: imported="${actual}" excel="${expected}"`);
+      mismatches.push(`${field}: mongo="${actual}" excel="${expected}"`);
     }
   }
   return mismatches;
 }
 
-function main(): void {
-  const data = loadMasterData(true);
-  const excelDir = data.sourceDirectory;
+async function main(): Promise<void> {
+  if (!config.mongodbUri) throw new Error('Missing MONGODB_URI');
+  await mongoose.connect(config.mongodbUri);
 
-  console.log('=== Master Data Excel Verification ===');
-  console.log(`Directory: ${excelDir}`);
-  console.log(`Files: ${data.sourceFiles.length}`);
+  const buyers = await listBuyers();
+  const data = buildMasterDataFromBuyers(buyers, {
+    sourceDirectory: 'mongodb://buyers',
+    sourceFiles: [...new Set(buyers.map((b) => b.sourceFile))].sort((a, b) => a.localeCompare(b)),
+  });
+
+  const excelDir = resolveExcelDirectory();
+  const parsed = parseExcelDirectory(excelDir);
+
+  console.log('=== Master Data Mongo Verification ===');
+  console.log(`Mongo buyers: ${data.buyers.length}`);
+  console.log(`Excel directory: ${excelDir}`);
+  console.log(`Excel files: ${parsed.sourceFiles.length}`);
   console.log(`Salts: ${data.salts.length}`);
   console.log(`Medicines: ${data.medicines.length}`);
-  console.log(`Buyers: ${data.buyers.length}`);
   console.log('');
 
   const allExcelRows: RawRow[] = [];
   const fileStats: Array<{ file: string; rows: number; headerOk: boolean }> = [];
 
-  for (const file of data.sourceFiles) {
+  for (const file of parsed.sourceFiles) {
     const filePath = path.join(excelDir, file);
     const workbook = read(readFileSync(filePath), { type: 'buffer', cellDates: false });
     const sheet = workbook.Sheets[workbook.SheetNames[0] ?? ''];
     const rows = utils.sheet_to_json<unknown[]>(sheet, { header: 1, defval: '' });
     const headerOk = detectHeaderRow(rows) >= 0;
-    const parsed = parseExcelFile(filePath, file);
-    fileStats.push({ file, rows: parsed.length, headerOk });
-    allExcelRows.push(...parsed);
+    const parsedRows = parseExcelFile(filePath, file);
+    fileStats.push({ file, rows: parsedRows.length, headerOk });
+    allExcelRows.push(...parsedRows);
   }
 
   console.log('--- Per-file row counts ---');
@@ -248,12 +260,10 @@ function main(): void {
   console.log('');
 
   const excelByKey = new Map(allExcelRows.map((r) => [rowKey(r), r]));
-  const buyerByKey = new Map(
-    data.buyers.map((b) => [rowKey(b), b])
-  );
+  const buyerByKey = new Map(data.buyers.map((b) => [rowKey(b), b]));
 
-  const missingInImport = [...excelByKey.keys()].filter((k) => !buyerByKey.has(k));
-  const extraInImport = [...buyerByKey.keys()].filter((k) => !excelByKey.has(k));
+  const missingInMongo = [...excelByKey.keys()].filter((k) => !buyerByKey.has(k));
+  const extraInMongo = [...buyerByKey.keys()].filter((k) => !excelByKey.has(k));
 
   const fieldMismatches: Array<{ key: string; issues: string[] }> = [];
   for (const [key, excelRow] of excelByKey) {
@@ -263,7 +273,6 @@ function main(): void {
     if (issues.length) fieldMismatches.push({ key, issues });
   }
 
-  // Salt / medicine coverage
   const productsInExcel = new Set(allExcelRows.map((r) => r.productName.toLowerCase()));
   const saltNames = new Set(data.salts.map((s) => s.name.toLowerCase()));
   const medNames = new Set(data.medicines.map((m) => m.name.toLowerCase()));
@@ -274,11 +283,7 @@ function main(): void {
   const saltBuyerCounts = new Map<string, number>();
   for (const row of allExcelRows) {
     const key = row.productName.toLowerCase();
-    const buyers = new Set<string>();
-    if (!saltBuyerCounts.has(key)) saltBuyerCounts.set(key, 0);
-    const existing = allExcelRows.filter(
-      (r) => r.productName.toLowerCase() === key
-    );
+    const existing = allExcelRows.filter((r) => r.productName.toLowerCase() === key);
     const uniqueBuyers = new Set(existing.map((r) => r.buyerName.toLowerCase()));
     saltBuyerCounts.set(key, uniqueBuyers.size);
   }
@@ -288,31 +293,31 @@ function main(): void {
     const expected = saltBuyerCounts.get(salt.name.toLowerCase()) ?? 0;
     if (expected !== salt.buyerCount) {
       buyerCountMismatches.push(
-        `${salt.name}: excel unique buyers=${expected}, imported buyerCount=${salt.buyerCount}`
+        `${salt.name}: excel unique buyers=${expected}, mongo buyerCount=${salt.buyerCount}`
       );
     }
   }
 
   console.log('--- Verification results ---');
-  if (missingInImport.length) {
-    console.log(`MISSING in import (${missingInImport.length}):`);
-    for (const key of missingInImport.slice(0, 20)) {
+  if (missingInMongo.length) {
+    console.log(`MISSING in Mongo (${missingInMongo.length}):`);
+    for (const key of missingInMongo.slice(0, 20)) {
       console.log(`  - ${key}`);
     }
-    if (missingInImport.length > 20) {
-      console.log(`  ... and ${missingInImport.length - 20} more`);
+    if (missingInMongo.length > 20) {
+      console.log(`  ... and ${missingInMongo.length - 20} more`);
     }
   } else {
-    console.log('OK: Every Excel buyer row is present in import.');
+    console.log('OK: Every Excel buyer row is present in Mongo.');
   }
 
-  if (extraInImport.length) {
-    console.log(`EXTRA in import (${extraInImport.length}):`);
-    for (const key of extraInImport.slice(0, 20)) {
+  if (extraInMongo.length) {
+    console.log(`EXTRA in Mongo (${extraInMongo.length}):`);
+    for (const key of extraInMongo.slice(0, 20)) {
       console.log(`  - ${key}`);
     }
   } else {
-    console.log('OK: No extra buyer rows in import.');
+    console.log('OK: No extra buyer rows in Mongo.');
   }
 
   if (fieldMismatches.length) {
@@ -322,7 +327,7 @@ function main(): void {
       for (const issue of item.issues) console.log(`    ${issue}`);
     }
   } else {
-    console.log('OK: All imported buyer fields match Excel.');
+    console.log('OK: All Mongo buyer fields match Excel.');
   }
 
   if (missingSalts.length) {
@@ -345,15 +350,14 @@ function main(): void {
   }
 
   const passed =
-    !extraInImport.length &&
+    !extraInMongo.length &&
     !fieldMismatches.length &&
     !missingSalts.length &&
     !missingMeds.length &&
     !buyerCountMismatches.length &&
-    missingInImport.every((key) => {
+    missingInMongo.every((key) => {
       const excelRow = excelByKey.get(key);
       if (!excelRow) return false;
-      // Duplicate Excel row: same buyer data appears on an earlier row.
       const dupKey = [
         excelRow.productName.toLowerCase(),
         (excelRow.casNo || '').toLowerCase(),
@@ -385,16 +389,22 @@ function main(): void {
   console.log('');
   console.log(
     passed
-      ? 'RESULT: PASS — data matches Excel.'
+      ? 'RESULT: PASS — Mongo buyers match Excel.'
       : 'RESULT: FAIL — see issues above.'
   );
-  if (missingInImport.length && !fieldMismatches.length) {
+  if (missingInMongo.length && !fieldMismatches.length) {
     console.log('');
     console.log(
       'NOTE: Missing rows are exact duplicates already present on another row in the same file.'
     );
   }
+
+  await mongoose.disconnect();
   process.exit(passed ? 0 : 1);
 }
 
-main();
+void main().catch(async (err) => {
+  console.error('Verification failed:', err);
+  await mongoose.disconnect().catch(() => undefined);
+  process.exit(1);
+});
