@@ -46,6 +46,10 @@ export interface EmailThreadListItem {
   messageCount: number;
   labelIds?: string[];
   isUnread: boolean;
+  importance?: string;
+  inferenceClassification?: string;
+  categories?: string[];
+  isDraft?: boolean;
 }
 
 export interface EmailMessage {
@@ -59,6 +63,10 @@ export interface EmailMessage {
   subject: string;
   date: string | null;
   isUnread: boolean;
+  importance?: string;
+  inferenceClassification?: string;
+  categories?: string[];
+  isDraft?: boolean;
   htmlBody: string | null;
   textBody: string | null;
   attachments: {

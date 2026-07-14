@@ -37,6 +37,7 @@ const FOLDER_MAP: Record<string, string> = {
   JUNK: 'junkemail',
   ARCHIVE: 'archive',
   OUTBOX: 'outbox',
+  CONVERSATION_HISTORY: 'conversationhistory',
 };
 
 const REVERSE_FOLDER_MAP: Record<string, string> = {
@@ -47,6 +48,7 @@ const REVERSE_FOLDER_MAP: Record<string, string> = {
   junkemail: 'JUNK',
   archive: 'ARCHIVE',
   outbox: 'OUTBOX',
+  conversationhistory: 'CONVERSATION_HISTORY',
 };
 
 function ensureOutlookConfigured(): void {
@@ -165,10 +167,21 @@ function formatRecipients(
     .join(', ');
 }
 
-function synthesizeLabelIds(message: { isRead?: boolean; flag?: { flagStatus?: string } }): string[] {
+function synthesizeLabelIds(message: {
+  isRead?: boolean;
+  flag?: { flagStatus?: string };
+  importance?: string;
+  inferenceClassification?: string;
+}): string[] {
   const ids: string[] = [];
   if (message.isRead === false) ids.push('UNREAD');
   if (message.flag?.flagStatus === 'flagged') ids.push('STARRED');
+  if (
+    message.importance === 'high' ||
+    message.inferenceClassification === 'focused'
+  ) {
+    ids.push('IMPORTANT');
+  }
   return ids;
 }
 
@@ -191,6 +204,10 @@ function formatThreadListItem(message: {
   sentDateTime?: string;
   isRead?: boolean;
   flag?: { flagStatus?: string };
+  importance?: string;
+  inferenceClassification?: string;
+  categories?: string[];
+  isDraft?: boolean;
 }): EmailThreadListItem {
   return {
     id: message.conversationId || message.id,
@@ -205,6 +222,10 @@ function formatThreadListItem(message: {
     messageCount: 1,
     labelIds: synthesizeLabelIds(message),
     isUnread: !message.isRead,
+    importance: message.importance,
+    inferenceClassification: message.inferenceClassification,
+    categories: message.categories,
+    isDraft: message.isDraft,
   };
 }
 
@@ -221,6 +242,10 @@ function formatMessage(message: {
   sentDateTime?: string;
   isRead?: boolean;
   flag?: { flagStatus?: string };
+  importance?: string;
+  inferenceClassification?: string;
+  categories?: string[];
+  isDraft?: boolean;
   attachments?: Array<{ id?: string; name?: string; contentType?: string; size?: number }>;
 }): EmailMessage {
   const bodyType = String(message.body?.contentType || '').toLowerCase();
@@ -246,6 +271,10 @@ function formatMessage(message: {
     subject: message.subject || '(No subject)',
     date: message.receivedDateTime || message.sentDateTime || null,
     isUnread: !message.isRead,
+    importance: message.importance,
+    inferenceClassification: message.inferenceClassification,
+    categories: message.categories,
+    isDraft: message.isDraft,
     htmlBody,
     textBody,
     attachments: (message.attachments || []).map((att) => ({
@@ -424,6 +453,48 @@ async function resolveMessageIdsForThread(client: Client, threadId: string): Pro
     return [];
   }
   return [];
+}
+
+async function getWellKnownFolderId(
+  client: Client,
+  wellKnownName: string
+): Promise<string | null> {
+  try {
+    const folder = (await client
+      .api(`/me/mailFolders/${encodeURIComponent(wellKnownName)}`)
+      .select('id')
+      .get()) as { id?: string };
+    return folder.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Only messages physically in the folder — Graph move is per-message, per-folder. */
+async function resolveMessageIdsInFolder(
+  client: Client,
+  threadId: string,
+  folderWellKnown: 'inbox' | 'archive' | 'deleteditems' | 'drafts' | 'outbox'
+): Promise<string[]> {
+  const folderId = await getWellKnownFolderId(client, folderWellKnown);
+  const messageIds = await resolveMessageIdsForThread(client, threadId);
+  if (!folderId || messageIds.length === 0) return messageIds;
+
+  const inFolder: string[] = [];
+  for (const messageId of messageIds) {
+    try {
+      const message = (await client
+        .api(resolveMessagePath(messageId))
+        .select('parentFolderId')
+        .get()) as { parentFolderId?: string };
+      if (message.parentFolderId === folderId) {
+        inFolder.push(messageId);
+      }
+    } catch (err) {
+      if (!isGraphNotFound(err)) throw err;
+    }
+  }
+  return inFolder;
 }
 
 export async function getMicrosoftAuthUrl(userId: string): Promise<string> {
@@ -629,10 +700,16 @@ export async function listThreads(
         .api(endpoint)
         .top(Math.min(pageSize * 2, 100))
         .select(
-          'id,conversationId,subject,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime,isRead,flag'
+          'id,conversationId,subject,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime,isRead,flag,importance,inferenceClassification,categories,isDraft'
         );
       if (opts.query && opts.query.trim()) {
         request = request.search(`"${opts.query.trim().replace(/"/g, '\\"')}"`);
+      } else if (
+        folderId &&
+        (folderId === 'sentitems' || folderId === 'drafts' || folderId === 'outbox')
+      ) {
+        // Sent/draft/outbox messages often lack receivedDateTime; ordering by it 400s.
+        request = request.orderby('sentDateTime desc');
       } else {
         request = request.orderby('receivedDateTime desc');
       }
@@ -706,7 +783,7 @@ export async function getThread(
             const full = (await client
               .api(resolveMessagePath(id))
               .select(
-                'id,conversationId,subject,bodyPreview,body,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,flag'
+                'id,conversationId,subject,bodyPreview,body,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,flag,importance,inferenceClassification,categories,isDraft'
               )
               // Metadata only — a bare $expand=attachments inlines contentBytes,
               // so one big PDF turns a thread read into a multi-MB response.
@@ -734,7 +811,7 @@ export async function getMessage(
     const full = (await client
       .api(resolveMessagePath(messageId))
       .select(
-        'id,conversationId,subject,bodyPreview,body,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,flag'
+        'id,conversationId,subject,bodyPreview,body,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,flag,importance,inferenceClassification,categories,isDraft'
       )
       .expand('attachments($select=id,name,contentType,size)')
       .get()) as Parameters<typeof formatMessage>[0];
@@ -889,6 +966,9 @@ export async function modifyMessage(
 
     if (addLabelIds.includes('SPAM')) {
       await client.api(`${resolveMessagePath(messageId)}/move`).post({ destinationId: 'junkemail' });
+    } else if (addLabelIds.includes('INBOX')) {
+      // Microsoft Graph: POST /me/messages/{id}/move { destinationId: "inbox" }
+      await client.api(`${resolveMessagePath(messageId)}/move`).post({ destinationId: 'inbox' });
     } else if (removeLabelIds.includes('INBOX')) {
       await client.api(`${resolveMessagePath(messageId)}/move`).post({ destinationId: 'archive' });
     }
@@ -904,10 +984,27 @@ export async function batchModifyThreads(
   opts: { addLabelIds?: string[]; removeLabelIds?: string[] }
 ): Promise<{ success: true; modified: number }> {
   const account = await requireAccountForUser(userId, accountId);
+  const addLabelIds = opts.addLabelIds || [];
+  const removeLabelIds = opts.removeLabelIds || [];
+
   const uniqueMessageIds = await withGraphRetry(account, async (client) => {
     const all: string[] = [];
     for (const tid of threadIds) {
-      const ids = await resolveMessageIdsForThread(client, tid);
+      let ids: string[];
+      if (removeLabelIds.includes('INBOX')) {
+        ids = await resolveMessageIdsInFolder(client, tid, 'inbox');
+      } else if (addLabelIds.includes('INBOX')) {
+        // Restore from Trash or unarchive — only move messages in those folders.
+        ids = await resolveMessageIdsInFolder(client, tid, 'deleteditems');
+        if (ids.length === 0) {
+          ids = await resolveMessageIdsInFolder(client, tid, 'archive');
+        }
+        if (ids.length === 0) {
+          ids = await resolveMessageIdsForThread(client, tid);
+        }
+      } else {
+        ids = await resolveMessageIdsForThread(client, tid);
+      }
       all.push(...ids);
     }
     return [...new Set(all)];

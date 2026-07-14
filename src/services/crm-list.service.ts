@@ -57,8 +57,12 @@ export function crmList(entity: CrmEntityName): CrmListService {
         (item, index) => new Model({ ...item, userId, _order: index })
       );
       for (const doc of docs) {
-        const err = doc.validateSync();
-        if (err) throw new HttpError(400, err.message);
+        try {
+          await doc.validate();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : 'Validation failed';
+          throw new HttpError(400, message);
+        }
       }
 
       const idSet = new Set(ids);
