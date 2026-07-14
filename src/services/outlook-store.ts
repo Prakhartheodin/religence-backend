@@ -5,6 +5,22 @@ import type { AccountStatus, OutlookAccount } from '../types/email.js';
 
 function toOutlookAccount(doc: Partial<OutlookAccount> | null | undefined): OutlookAccount | null {
   if (!doc || !doc.id || !doc.userId || !doc.email) return null;
+
+  const storedAccess = String(doc.accessToken ?? '');
+  const storedRefresh =
+    doc.refreshToken === null || doc.refreshToken === undefined
+      ? null
+      : String(doc.refreshToken);
+  const accessToken = decryptToken(storedAccess);
+  const refreshToken = storedRefresh === null ? null : decryptToken(storedRefresh);
+
+  // decryptToken returns null when the key no longer opens the ciphertext (key
+  // rotation, or the first time TOKEN_ENC_KEY is set). The tokens are gone, so
+  // report the account as errored and let the user reconnect.
+  const undecryptable =
+    (storedAccess !== '' && accessToken === null) ||
+    (storedRefresh !== null && refreshToken === null);
+
   return {
     id: String(doc.id),
     userId: String(doc.userId),
@@ -14,16 +30,13 @@ function toOutlookAccount(doc: Partial<OutlookAccount> | null | undefined): Outl
       doc.displayName === null || doc.displayName === undefined
         ? null
         : String(doc.displayName).trim() || null,
-    accessToken: decryptToken(String(doc.accessToken ?? '')) ?? '',
-    refreshToken:
-      doc.refreshToken === null || doc.refreshToken === undefined
-        ? null
-        : decryptToken(String(doc.refreshToken)),
+    accessToken: accessToken ?? '',
+    refreshToken,
     tokenExpiry:
       doc.tokenExpiry === null || doc.tokenExpiry === undefined
         ? null
         : String(doc.tokenExpiry),
-    status: (doc.status as AccountStatus) ?? 'active',
+    status: undecryptable ? 'error' : ((doc.status as AccountStatus) ?? 'active'),
     createdAt: String(doc.createdAt ?? ''),
     updatedAt: String(doc.updatedAt ?? ''),
   };

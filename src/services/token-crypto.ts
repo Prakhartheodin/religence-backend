@@ -35,17 +35,28 @@ export function encryptToken(plain: string | null): string | null {
   )}`;
 }
 
+/**
+ * Returns null when the ciphertext cannot be opened — which is what happens to
+ * every existing row the first time TOKEN_ENC_KEY is set (rows were encrypted
+ * under the AUTH_JWT_SECRET fallback), or whenever either key is rotated.
+ * Callers treat null as "reconnect this mailbox"; throwing here would 500 every
+ * email endpoint with no way out but hand-editing Mongo.
+ */
 export function decryptToken(stored: string | null): string | null {
   if (stored == null || stored === '') return stored;
   if (!stored.startsWith(PREFIX)) return stored; // legacy plaintext
   const [ivB64, tagB64, dataB64] = stored.slice(PREFIX.length).split(':');
-  if (!ivB64 || !tagB64 || !dataB64) return stored;
-  const decipher = createDecipheriv(ALGO, key(), Buffer.from(ivB64, 'base64'));
-  decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
-  return Buffer.concat([
-    decipher.update(Buffer.from(dataB64, 'base64')),
-    decipher.final(),
-  ]).toString('utf8');
+  if (!ivB64 || !tagB64 || !dataB64) return null;
+  try {
+    const decipher = createDecipheriv(ALGO, key(), Buffer.from(ivB64, 'base64'));
+    decipher.setAuthTag(Buffer.from(tagB64, 'base64'));
+    return Buffer.concat([
+      decipher.update(Buffer.from(dataB64, 'base64')),
+      decipher.final(),
+    ]).toString('utf8');
+  } catch {
+    return null;
+  }
 }
 
 // demo: round-trips a token and confirms legacy plaintext passes through.
@@ -59,6 +70,13 @@ if (process.argv[1]?.endsWith('token-crypto.ts')) {
   if (decryptToken(enc) !== raw) throw new Error('round-trip failed');
   if (decryptToken('legacy-plaintext') !== 'legacy-plaintext') throw new Error('passthrough failed');
   if (decryptToken(null) !== null || decryptToken('') !== '') throw new Error('nullish failed');
+
+  // Rotating the key must yield null (reconnect), never a throw.
+  config.tokenEncKey = 'a-different-key';
+  if (decryptToken(enc) !== null) throw new Error('rotated key should not decrypt');
+  if (decryptToken(`${PREFIX}garbage`) !== null) throw new Error('malformed should be null');
+  config.tokenEncKey = 'test-key-not-for-prod';
+
   // eslint-disable-next-line no-console
   console.log('token-crypto self-check passed');
 }

@@ -113,6 +113,15 @@ function isGraphUnauthorized(err: unknown): boolean {
   return raw.statusCode === 401 || raw.status === 401 || raw.code === 'InvalidAuthenticationToken';
 }
 
+function isGraphNotFound(err: unknown): boolean {
+  const raw = err as { statusCode?: number; status?: number | string; code?: string };
+  return raw.statusCode === 404 || raw.status === 404 || raw.code === 'ErrorItemNotFound';
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function stripTags(value: string): string {
   if (!value) return '';
   return value
@@ -254,7 +263,13 @@ async function requireAccountForUser(
   accountId: string
 ): Promise<OutlookAccount> {
   const account = await findOutlookAccountById(userId, accountId);
-  if (!account || account.status !== 'active') {
+  if (!account) {
+    throw new HttpError(404, 'Outlook account not found');
+  }
+  if (account.status === 'error') {
+    throw new HttpError(401, 'Outlook credentials are no longer readable. Reconnect Outlook.');
+  }
+  if (account.status !== 'active') {
     throw new HttpError(404, 'Outlook account not found');
   }
   return account;
@@ -304,9 +319,17 @@ async function refreshAccessToken(account: OutlookAccount): Promise<OutlookAccou
   }
 
   if (!result.ok || typeof result.payload.access_token !== 'string') {
-    await updateOutlookAccount(account.userId, account.id, { status: 'error' });
+    // Only a dead grant warrants forcing a reconnect. A Microsoft 5xx or a
+    // lost race against a concurrent refresh is retryable — the stored
+    // refresh token is still good, so don't brick the account over it.
+    const fatal = ['invalid_grant', 'interaction_required', 'unauthorized_client'].includes(
+      String(result.payload.error)
+    );
+    if (fatal) {
+      await updateOutlookAccount(account.userId, account.id, { status: 'error' });
+    }
     throw new HttpError(
-      401,
+      fatal ? 401 : 503,
       typeof result.payload.error_description === 'string'
         ? result.payload.error_description
         : 'Outlook token refresh failed'
@@ -536,6 +559,9 @@ export async function listLabels(userId: string, accountId: string): Promise<Ema
   return withGraphRetry(account, async (client) => {
     const res = (await client
       .api('/me/mailFolders')
+      // wellKnownName only exists on the beta endpoint; on v1.0 it silently
+      // comes back absent and every folder would be typed "user" with a raw id.
+      .version('beta')
       .top(200)
       .get()) as {
       value?: Array<{
@@ -653,7 +679,12 @@ export async function listThreads(
     });
 
     return {
-      threads: threads.slice(0, pageSize),
+      // Return every thread from this fetch. Slicing to pageSize would drop
+      // threads that Graph's nextLink cursor has already advanced past, so
+      // they'd never appear on any page.
+      // ponytail: a thread whose messages straddle a page boundary can repeat
+      // on the next page; dedup by thread id client-side if paging ever ships.
+      threads,
       nextPageToken: res?.['@odata.nextLink'] || null,
       resultSizeEstimate: threads.length,
     };
@@ -677,7 +708,9 @@ export async function getThread(
               .select(
                 'id,conversationId,subject,bodyPreview,body,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,flag'
               )
-              .expand('attachments')
+              // Metadata only — a bare $expand=attachments inlines contentBytes,
+              // so one big PDF turns a thread read into a multi-MB response.
+              .expand('attachments($select=id,name,contentType,size)')
               .get()) as Parameters<typeof formatMessage>[0];
             return formatMessage(full);
           } catch {
@@ -703,7 +736,7 @@ export async function getMessage(
       .select(
         'id,conversationId,subject,bodyPreview,body,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,flag'
       )
-      .expand('attachments')
+      .expand('attachments($select=id,name,contentType,size)')
       .get()) as Parameters<typeof formatMessage>[0];
     return formatMessage(full);
   });
@@ -761,6 +794,7 @@ export async function replyMessage(
 ): Promise<{ id: null; threadId: null }> {
   const account = await requireAccountForUser(userId, accountId);
   await withGraphRetry(account, async (client) => {
+    // Docs: specify EITHER comment OR message.body — both together is a 400.
     await client.api(`${resolveMessagePath(messageId)}/reply`).post({
       message: {
         body: {
@@ -768,7 +802,6 @@ export async function replyMessage(
           content: payload.html || '<p></p>',
         },
       },
-      comment: '',
     });
     return true;
   });
@@ -810,18 +843,23 @@ export async function forwardMessage(
   const subject = original.subject.startsWith('Fwd:')
     ? original.subject
     : `Fwd: ${original.subject}`;
-  const body = [
+  // The message is sent as HTML: escape the header fields ("Name <email>"
+  // would otherwise be swallowed as a tag) and use <br/>, not \n.
+  const headerHtml = [
     '---------- Forwarded message ---------',
-    `From: ${original.from}`,
-    `Date: ${original.date || ''}`,
-    `Subject: ${original.subject}`,
-    `To: ${original.to}`,
-    ...(original.cc ? [`Cc: ${original.cc}`] : []),
-    '',
-    original.htmlBody || original.textBody || '',
-    '',
-    payload.html || '',
-  ].join('\n');
+    `From: ${escapeHtml(original.from)}`,
+    `Date: ${escapeHtml(original.date || '')}`,
+    `Subject: ${escapeHtml(original.subject)}`,
+    `To: ${escapeHtml(original.to)}`,
+    ...(original.cc ? [`Cc: ${escapeHtml(original.cc)}`] : []),
+  ].join('<br/>');
+  const originalBody =
+    original.htmlBody ??
+    (original.textBody ? escapeHtml(original.textBody).replace(/\n/g, '<br/>') : '');
+  // Sender's comment on top, like every mail client.
+  const body = [payload.html || '', headerHtml, originalBody]
+    .filter(Boolean)
+    .join('<br/><br/>');
   return sendMessage(userId, accountId, {
     to: payload.to,
     subject,
@@ -892,7 +930,14 @@ export async function trashThreads(
     for (const tid of threadIds) {
       const ids = await resolveMessageIdsForThread(client, tid);
       for (const id of ids) {
-        await client.api(`${resolveMessagePath(id)}/move`).post({ destinationId: 'deleteditems' });
+        try {
+          await client.api(`${resolveMessagePath(id)}/move`).post({ destinationId: 'deleteditems' });
+        } catch (err) {
+          // Graph message ids change on move. If the token expires mid-loop,
+          // withGraphRetry re-runs the whole batch and the already-moved
+          // messages 404 under their old ids — that means done, not failed.
+          if (!isGraphNotFound(err)) throw err;
+        }
       }
     }
     return true;
