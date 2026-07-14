@@ -74,15 +74,18 @@ emailRouter.get('/auth/microsoft/callback', async (req, res, next) => {
     const code = asString(req.query.code, 'code');
     const state = asString(req.query.state, 'state');
     const account = await handleMicrosoftCallback(code, state);
+    // Trailing slash matters: the frontend runs with trailingSlash:true, so
+    // /inbox redirects to /inbox/ and drops the query string on the way —
+    // taking outlook_connected with it, which left the new account unselected.
     res.redirect(
-      buildFrontendUrl(config.appBaseUrl, '/inbox', {
+      buildFrontendUrl(config.appBaseUrl, '/inbox/', {
         outlook_connected: account.email,
       })
     );
   } catch (err) {
     if (err instanceof HttpError) {
       return res.redirect(
-        buildFrontendUrl(config.appBaseUrl, '/inbox', {
+        buildFrontendUrl(config.appBaseUrl, '/inbox/', {
           outlook_error: err.message,
         })
       );
