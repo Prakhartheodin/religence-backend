@@ -1,5 +1,13 @@
-import { Router, type Request } from 'express';
+import express, { Router, type Request } from 'express';
+import { HttpError } from '../http-error.js';
+import {
+  buildMasterDataFromBuyers,
+  dedupeRows,
+  parseWorkbookBuffer,
+  rowToBuyer,
+} from '../lib/excel-master-data.js';
 import * as catalogue from '../services/catalogue.service.js';
+import { mergeUpsertBuyers } from '../services/buyer.service.js';
 import { clearMasterDataCache, loadMasterData } from '../services/master-data.service.js';
 
 export const masterDataRouter = Router();
@@ -87,6 +95,65 @@ masterDataRouter.delete('/medicines/:id', async (req, res, next) => {
     next(err);
   }
 });
+
+/**
+ * One-shot Excel import from the UI. Body is the raw .xlsx/.csv bytes
+ * (Content-Type application/octet-stream), filename in ?filename=. Reuses the
+ * seed parser: one buyer file -> buyers + derived salts + medicines, all linked
+ * by salt-<slug>/med-<slug>. Additive — other molecules are left untouched.
+ * ponytail: express.raw instead of adding multer; one dedicated route.
+ */
+masterDataRouter.post(
+  '/import',
+  express.raw({ type: () => true, limit: '20mb' }),
+  async (req, res, next) => {
+    try {
+      const filename = String(req.query.filename || '').trim() || 'upload.xlsx';
+      const buffer = req.body as Buffer;
+      if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+        throw new HttpError(400, 'Empty upload. Send the .xlsx file bytes.');
+      }
+
+      const rows = dedupeRows(parseWorkbookBuffer(buffer, filename));
+      if (!rows.length) {
+        throw new HttpError(
+          400,
+          'No buyer rows found. Expected columns like Product Name, Buyer Name, CAS No.'
+        );
+      }
+      const buyers = rows.map(rowToBuyer);
+      const master = buildMasterDataFromBuyers(buyers, {
+        sourceDirectory: 'upload',
+        sourceFiles: [filename],
+      });
+
+      const buyerResult = await mergeUpsertBuyers(buyers);
+      // salts before medicines: medicine.saltId is an FK into SaltCatalogue.
+      await catalogue.upsertSalts(
+        master.salts.map((s) => ({ id: s.id, name: s.name }))
+      );
+      await catalogue.upsertMedicines(
+        master.medicines.map((m) => ({
+          id: m.id,
+          saltIds: [m.saltId],
+          name: m.name,
+          dosageForm: m.dosageForm,
+        }))
+      );
+      clearMasterDataCache();
+
+      res.status(201).json({
+        sourceFile: filename,
+        buyers: buyers.length,
+        buyersNew: buyerResult.upserted,
+        salts: master.salts.length,
+        medicines: master.medicines.length,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 // Buyers live in MongoDB (seeded from Excel via scripts/seed-buyers-from-excel.mts).
 // Lead Discovery joins buyers against the deterministic salt-<slug> / med-<slug> ids.

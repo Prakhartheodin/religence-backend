@@ -156,7 +156,12 @@ function detectHeaderRow(rows: unknown[][]): number {
 }
 
 function parseWorkbookRows(filePath: string, fileName: string): CanonicalRow[] {
-  const workbook = read(readFileSync(filePath), { type: 'buffer', cellDates: false });
+  return parseWorkbookBuffer(readFileSync(filePath), fileName);
+}
+
+/** Parse a single uploaded workbook (buffer) into canonical buyer rows. */
+export function parseWorkbookBuffer(buffer: Buffer, fileName: string): CanonicalRow[] {
+  const workbook = read(buffer, { type: 'buffer', cellDates: false });
   const firstSheetName = workbook.SheetNames[0];
   if (!firstSheetName) return [];
   const sheet = workbook.Sheets[firstSheetName];

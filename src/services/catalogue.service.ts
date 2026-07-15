@@ -15,6 +15,17 @@ import { recordChanges } from './change-log.service.js';
 
 const str = (v: unknown): string => String(v ?? '').trim();
 
+/** Dedupe, trim, and confirm every salt id exists. Throws 400 on an unknown id. */
+async function validateSaltIds(raw: unknown): Promise<string[]> {
+  const ids = [...new Set((Array.isArray(raw) ? raw : []).map(str).filter(Boolean))];
+  for (const saltId of ids) {
+    if (!(await SaltCatalogue.exists({ id: saltId }))) {
+      throw new HttpError(400, `unknown saltId: ${saltId}`);
+    }
+  }
+  return ids;
+}
+
 export async function listSalts(): Promise<Record<string, unknown>[]> {
   const docs = await SaltCatalogue.find({}).sort({ name: 1 });
   return docs.map((d) => d.toJSON());
@@ -63,8 +74,9 @@ export async function updateSalt(
 
 export async function deleteSalt(id: string, actorUserId = ''): Promise<void> {
   // The only referential link in the catalogue. Leads point at salts by NAME,
-  // not id, so there is nothing else to check.
-  if (await MedicineCatalogue.exists({ saltId: id })) {
+  // not id, so there is nothing else to check. Match both shapes so an
+  // un-migrated `saltId` doc still blocks the delete.
+  if (await MedicineCatalogue.exists({ $or: [{ saltIds: id }, { saltId: id }] })) {
     throw new HttpError(409, 'salt has linked medicines');
   }
   const before = await SaltCatalogue.findOne({ id });
@@ -73,6 +85,49 @@ export async function deleteSalt(id: string, actorUserId = ''): Promise<void> {
   await recordChanges([
     { actorUserId, entity: 'salts', docId: id, op: 'delete', before: before.toJSON(), after: null },
   ]);
+}
+
+/**
+ * Idempotent bulk upsert used by the Excel import. Keyed by the deterministic
+ * salt-<slug> id so re-importing is a no-op. Uses $setOnInsert for name so a
+ * salt a user has since renamed in the master page is NOT reset by re-import.
+ */
+export async function upsertSalts(
+  salts: { id: string; name: string }[]
+): Promise<{ upserted: number; matched: number }> {
+  if (!salts.length) return { upserted: 0, matched: 0 };
+  const ops = salts.map((s) => ({
+    updateOne: {
+      filter: { id: s.id },
+      update: { $setOnInsert: { id: s.id, name: s.name } },
+      upsert: true,
+    },
+  }));
+  const r = await SaltCatalogue.bulkWrite(ops, { ordered: false });
+  return { upserted: r.upsertedCount, matched: r.matchedCount };
+}
+
+/** Idempotent bulk upsert of medicines. Salts must be upserted first (saltIds FK). */
+export async function upsertMedicines(
+  medicines: { id: string; saltIds: string[]; name: string; dosageForm: string }[]
+): Promise<{ upserted: number; matched: number }> {
+  if (!medicines.length) return { upserted: 0, matched: 0 };
+  const ops = medicines.map((m) => ({
+    updateOne: {
+      filter: { id: m.id },
+      update: {
+        $setOnInsert: {
+          id: m.id,
+          saltIds: m.saltIds,
+          name: m.name,
+          dosageForm: m.dosageForm || 'API',
+        },
+      },
+      upsert: true,
+    },
+  }));
+  const r = await MedicineCatalogue.bulkWrite(ops, { ordered: false });
+  return { upserted: r.upsertedCount, matched: r.matchedCount };
 }
 
 export async function listMedicines(): Promise<Record<string, unknown>[]> {
@@ -86,18 +141,15 @@ export async function createMedicine(
 ): Promise<Record<string, unknown>> {
   const id = str(body.id);
   const name = str(body.name);
-  const saltId = str(body.saltId);
+  const saltIds = await validateSaltIds(body.saltIds);
   const dosageForm = str(body.dosageForm) || 'API';
   if (!id) throw new HttpError(400, 'id is required');
   if (!name) throw new HttpError(400, 'name is required');
-  if (!saltId) throw new HttpError(400, 'saltId is required');
-  if (!(await SaltCatalogue.exists({ id: saltId }))) {
-    throw new HttpError(400, `unknown saltId: ${saltId}`);
-  }
+  if (!saltIds.length) throw new HttpError(400, 'at least one saltId is required');
   if (await MedicineCatalogue.exists({ id })) {
     throw new HttpError(409, `medicine ${id} already exists`);
   }
-  const doc = await MedicineCatalogue.create({ id, saltId, name, dosageForm });
+  const doc = await MedicineCatalogue.create({ id, saltIds, name, dosageForm });
   const json = doc.toJSON();
   await recordChanges([
     { actorUserId, entity: 'medicines', docId: id, op: 'create', before: null, after: json },
@@ -110,19 +162,17 @@ export async function updateMedicine(
   body: Record<string, unknown>,
   actorUserId = ''
 ): Promise<Record<string, unknown>> {
-  const set: Record<string, string> = {};
+  const set: Record<string, unknown> = {};
   if (body.name !== undefined) {
     const name = str(body.name);
     if (!name) throw new HttpError(400, 'name cannot be empty');
     set.name = name;
   }
   if (body.dosageForm !== undefined) set.dosageForm = str(body.dosageForm) || 'API';
-  if (body.saltId !== undefined) {
-    const saltId = str(body.saltId);
-    if (!(await SaltCatalogue.exists({ id: saltId }))) {
-      throw new HttpError(400, `unknown saltId: ${saltId}`);
-    }
-    set.saltId = saltId;
+  if (body.saltIds !== undefined) {
+    const saltIds = await validateSaltIds(body.saltIds);
+    if (!saltIds.length) throw new HttpError(400, 'at least one saltId is required');
+    set.saltIds = saltIds;
   }
   const before = await MedicineCatalogue.findOne({ id });
   if (!before) throw new HttpError(404, `medicine ${id} not found`);

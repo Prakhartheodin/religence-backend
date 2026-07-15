@@ -46,6 +46,27 @@ export async function countBuyers(): Promise<number> {
   return BuyerCatalogue.countDocuments();
 }
 
+/**
+ * Additive upsert for UI imports: upserts the given buyers by id but — unlike
+ * upsertBuyers — does NOT delete anything else, so importing one molecule's file
+ * leaves every other molecule's buyers in place. Re-importing the same file
+ * updates in place (buyer ids are a deterministic hash of the row).
+ */
+export async function mergeUpsertBuyers(
+  buyers: BuyerMasterModel[]
+): Promise<{ upserted: number; matched: number }> {
+  if (!buyers.length) throw new HttpError(400, 'No buyers to import');
+  const ops = buyers.map((buyer) => ({
+    updateOne: {
+      filter: { id: buyer.id },
+      update: { $set: buyer as unknown as Record<string, unknown> },
+      upsert: true,
+    },
+  }));
+  const result = await BuyerCatalogue.bulkWrite(ops, { ordered: false });
+  return { upserted: result.upsertedCount, matched: result.matchedCount };
+}
+
 export async function upsertBuyers(
   buyers: BuyerMasterModel[]
 ): Promise<{ upserted: number; matched: number; removed: number }> {

@@ -18,6 +18,12 @@ import mongoose from 'mongoose';
 
 const strip = (_doc: unknown, ret: Record<string, unknown>): Record<string, unknown> => {
   delete ret._id;
+  // Tolerate medicine docs written before the saltId -> saltIds change so the
+  // API returns the new shape even if the migration hasn't run yet.
+  if (ret.saltId !== undefined && ret.saltIds === undefined) {
+    ret.saltIds = ret.saltId ? [ret.saltId] : [];
+  }
+  delete ret.saltId;
   return ret;
 };
 
@@ -33,7 +39,8 @@ saltSchema.index({ id: 1 }, { unique: true, name: 'id_1' });
 const medicineSchema = new mongoose.Schema(
   {
     id: { type: String, required: true, trim: true },
-    saltId: { type: String, required: true, trim: true },
+    // A medicine can belong to more than one salt.
+    saltIds: { type: [String], required: true, default: [] },
     name: { type: String, required: true, trim: true },
     dosageForm: { type: String, default: 'API', trim: true },
   },
