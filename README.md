@@ -26,7 +26,6 @@ This backend now includes Outlook OAuth + inbox endpoints under ` /v1/email `.
 - Start OAuth (browser redirect): `GET /v1/email/auth/microsoft/start?userId=demo-user`
 - OAuth callback: `GET /v1/email/auth/microsoft/callback`
 - List accounts: `GET /v1/email/accounts`
-- List labels: `GET /v1/email/labels?accountId=<id>`
 - List threads: `GET /v1/email/threads?accountId=<id>`
 - Get thread: `GET /v1/email/threads/<threadId>?accountId=<id>`
 - Send mail: `POST /v1/email/messages/send`

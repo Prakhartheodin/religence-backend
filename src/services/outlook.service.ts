@@ -13,7 +13,7 @@ import {
   updateOutlookAccount,
   upsertOutlookAccount,
 } from './outlook-store.js';
-import type { EmailAccountPublic, EmailLabel, EmailMessage, EmailThreadListItem, OutlookAccount } from '../types/email.js';
+import type { EmailAccountPublic, EmailMessage, EmailThreadListItem, OutlookAccount } from '../types/email.js';
 
 const SCOPES = [
   'openid',
@@ -38,17 +38,6 @@ const FOLDER_MAP: Record<string, string> = {
   ARCHIVE: 'archive',
   OUTBOX: 'outbox',
   CONVERSATION_HISTORY: 'conversationhistory',
-};
-
-const REVERSE_FOLDER_MAP: Record<string, string> = {
-  inbox: 'INBOX',
-  sentitems: 'SENT',
-  deleteditems: 'TRASH',
-  drafts: 'DRAFT',
-  junkemail: 'JUNK',
-  archive: 'ARCHIVE',
-  outbox: 'OUTBOX',
-  conversationhistory: 'CONVERSATION_HISTORY',
 };
 
 function ensureOutlookConfigured(): void {
@@ -625,38 +614,6 @@ export async function disconnectOutlookAccount(userId: string, accountId: string
   await setOutlookAccountStatus(userId, account.id, 'revoked');
 }
 
-export async function listLabels(userId: string, accountId: string): Promise<EmailLabel[]> {
-  const account = await requireAccountForUser(userId, accountId);
-  return withGraphRetry(account, async (client) => {
-    const res = (await client
-      .api('/me/mailFolders')
-      // wellKnownName only exists on the beta endpoint; on v1.0 it silently
-      // comes back absent and every folder would be typed "user" with a raw id.
-      .version('beta')
-      .top(200)
-      .get()) as {
-      value?: Array<{
-        id: string;
-        displayName?: string;
-        wellKnownName?: string;
-        totalItemCount?: number;
-        unreadItemCount?: number;
-      }>;
-    };
-
-    return (res.value || []).map((folder) => {
-      const wellKnown = String(folder.wellKnownName || '').toLowerCase();
-      return {
-        id: REVERSE_FOLDER_MAP[wellKnown] || folder.id,
-        name: folder.displayName || folder.wellKnownName || folder.id,
-        type: wellKnown ? 'system' : 'user',
-        messagesTotal: folder.totalItemCount ?? 0,
-        messagesUnread: folder.unreadItemCount ?? 0,
-      };
-    });
-  });
-}
-
 export async function listThreads(
   userId: string,
   accountId: string,
@@ -964,9 +921,7 @@ export async function modifyMessage(
       await client.api(resolveMessagePath(messageId)).patch(patch);
     }
 
-    if (addLabelIds.includes('SPAM')) {
-      await client.api(`${resolveMessagePath(messageId)}/move`).post({ destinationId: 'junkemail' });
-    } else if (addLabelIds.includes('INBOX')) {
+    if (addLabelIds.includes('INBOX')) {
       // Microsoft Graph: POST /me/messages/{id}/move { destinationId: "inbox" }
       await client.api(`${resolveMessagePath(messageId)}/move`).post({ destinationId: 'inbox' });
     } else if (removeLabelIds.includes('INBOX')) {

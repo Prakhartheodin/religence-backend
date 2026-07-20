@@ -200,3 +200,8 @@ export async function resetPassword(raw: string, newPassword: string): Promise<v
   const { hash, salt } = hashPassword(newPassword);
   await store.updateUser(userId, { passwordHash: hash, passwordSalt: salt });
 }
+
+/** Registered Religence team members — not customer CRM contacts. */
+export async function listTeamAssignees(): Promise<string[]> {
+  return store.listTeamMemberNames();
+}

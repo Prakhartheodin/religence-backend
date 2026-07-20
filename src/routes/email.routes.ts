@@ -13,7 +13,6 @@ import {
   getMicrosoftAuthUrl,
   getThread,
   handleMicrosoftCallback,
-  listLabels,
   listOutlookAccounts,
   listThreads,
   modifyMessage,
@@ -128,18 +127,6 @@ emailRouter.put('/templates', async (req, res, next) => {
       : req.body?.templates;
     const templates = await replaceEmailTemplates(requireUserId(req), rawTemplates);
     res.json(templates);
-  } catch (err) {
-    next(err);
-  }
-});
-
-emailRouter.get('/labels', async (req, res, next) => {
-  try {
-    const labels = await listLabels(
-      requireUserId(req),
-      asString(req.query.accountId, 'accountId')
-    );
-    res.json(labels);
   } catch (err) {
     next(err);
   }

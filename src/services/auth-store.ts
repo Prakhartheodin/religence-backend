@@ -20,6 +20,16 @@ export async function findById(userId: string): Promise<User | null> {
   return UserModel.findOne({ userId }).lean<User>();
 }
 
+/** Internal Religence users eligible as lead assignees (not CRM contacts). */
+export async function listTeamMemberNames(): Promise<string[]> {
+  const users = await UserModel.find({})
+    .sort({ name: 1 })
+    .select('name')
+    .lean<Pick<User, 'name'>[]>();
+  const names = users.map((u) => u.name.trim()).filter(Boolean);
+  return [...new Set(names)];
+}
+
 export async function createUser(u: User): Promise<User> {
   await UserModel.create(u);
   return u;

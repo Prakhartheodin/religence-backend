@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { requireAuth } from '../middleware/require-auth.js';
 import * as auth from '../services/auth.service.js';
 
 export const authRouter = Router();
@@ -58,6 +59,15 @@ authRouter.post('/reset-password', async (req, res, next) => {
   try {
     await auth.resetPassword(str(req.body.token), String(req.body.password ?? ''));
     res.json({ status: 'ok' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Internal sales team for lead assignment — not CRM customer contacts. */
+authRouter.get('/team-assignees', requireAuth, async (_req, res, next) => {
+  try {
+    res.json({ assignees: await auth.listTeamAssignees() });
   } catch (err) {
     next(err);
   }

@@ -25,14 +25,6 @@ export interface EmailAccountPublic {
   createdAt: string;
 }
 
-export interface EmailLabel {
-  id: string;
-  name: string;
-  type?: string;
-  messagesTotal?: number;
-  messagesUnread?: number;
-}
-
 export interface EmailThreadListItem {
   id: string;
   threadId: string;

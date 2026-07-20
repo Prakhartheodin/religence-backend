@@ -16,6 +16,8 @@ const ENTITIES: CrmEntityName[] = [
   'deals',
   'timeline',
   'emails',
+  'samples',
+  'quotations',
 ];
 
 for (const entity of ENTITIES) {
