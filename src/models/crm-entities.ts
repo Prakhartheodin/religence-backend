@@ -240,6 +240,23 @@ export const CrmEntities = {
     },
   }),
 
+  followUps: entityModel('FollowUp', {
+    collection: 'follow_ups',
+    calendar: ['createdAt'],
+    fields: {
+      leadId: { type: String, default: '' },
+      entryDate: { type: String, default: '' },
+      contactedBy: { type: String, default: '' },
+      mode: { type: String, default: '' },
+      outcome: { type: String, default: '' },
+      summary: { type: String, default: '' },
+      infoShared: { type: String, default: '' },
+      nextStep: { type: String, default: '' },
+      nextFollowUp: { type: String, default: '' },
+      createdAt: { type: Date },
+    },
+  }),
+
   // Salts and medicines are NOT here: they are a shared catalogue, not per-user
   // lists. See models/catalogue.ts. Routing them through this per-user machinery
   // is what gave every user a private copy of the same 10 rows.
