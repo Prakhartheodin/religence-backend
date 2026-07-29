@@ -13,6 +13,7 @@ import {
   updateOutlookAccount,
   upsertOutlookAccount,
 } from './outlook-store.js';
+import { OutlookSyncStateModel } from '../models/outlook-sync-state.model.js';
 import type { EmailAccountPublic, EmailMessage, EmailThreadListItem, OutlookAccount } from '../types/email.js';
 
 const SCOPES = [
@@ -39,6 +40,17 @@ const FOLDER_MAP: Record<string, string> = {
   OUTBOX: 'outbox',
   CONVERSATION_HISTORY: 'conversationhistory',
 };
+
+const ALL_SYNC_FOLDER_LABELS = Object.keys(FOLDER_MAP);
+
+const IMMUTABLE_ID_PREFER = 'IdType="ImmutableId"';
+
+const DELTA_MESSAGE_SELECT =
+  'id,conversationId,subject,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime,isRead,flag,importance,inferenceClassification,categories,isDraft';
+
+function mailApi(client: Client, path: string) {
+  return client.api(path).header('Prefer', IMMUTABLE_ID_PREFER);
+}
 
 function ensureOutlookConfigured(): void {
   if (!config.microsoft.clientId || !config.microsoft.clientSecret) {
@@ -408,8 +420,7 @@ function resolveMessagePath(messageId: string): string {
 
 async function listMessageIdsByConversationId(client: Client, conversationId: string): Promise<string[]> {
   const escaped = conversationId.replace(/'/g, "''");
-  const res = (await client
-    .api('/me/messages')
+  const res = (await mailApi(client, '/me/messages')
     .filter(`conversationId eq '${escaped}'`)
     .select('id,receivedDateTime')
     .top(50)
@@ -433,8 +444,7 @@ async function resolveMessageIdsForThread(client: Client, threadId: string): Pro
     // fallback to one message id path below
   }
   try {
-    const one = (await client
-      .api(resolveMessagePath(threadId))
+    const one = (await mailApi(client, resolveMessagePath(threadId))
       .select('id')
       .get()) as { id?: string };
     if (one.id) return [one.id];
@@ -449,8 +459,7 @@ async function getWellKnownFolderId(
   wellKnownName: string
 ): Promise<string | null> {
   try {
-    const folder = (await client
-      .api(`/me/mailFolders/${encodeURIComponent(wellKnownName)}`)
+    const folder = (await mailApi(client, `/me/mailFolders/${encodeURIComponent(wellKnownName)}`)
       .select('id')
       .get()) as { id?: string };
     return folder.id ?? null;
@@ -472,8 +481,7 @@ async function resolveMessageIdsInFolder(
   const inFolder: string[] = [];
   for (const messageId of messageIds) {
     try {
-      const message = (await client
-        .api(resolveMessagePath(messageId))
+      const message = (await mailApi(client, resolveMessagePath(messageId))
         .select('parentFolderId')
         .get()) as { parentFolderId?: string };
       if (message.parentFolderId === folderId) {
@@ -647,14 +655,13 @@ export async function listThreads(
       | undefined;
 
     if (opts.pageToken) {
-      res = (await client.api(opts.pageToken).get()) as typeof res;
+      res = (await mailApi(client, opts.pageToken).get()) as typeof res;
     } else {
       const folderId = normalizeFolderId(opts.labelId);
       const endpoint = folderId
         ? `/me/mailFolders/${encodeURIComponent(folderId)}/messages`
         : '/me/messages';
-      let request = client
-        .api(endpoint)
+      let request = mailApi(client, endpoint)
         .top(Math.min(pageSize * 2, 100))
         .select(
           'id,conversationId,subject,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime,isRead,flag,importance,inferenceClassification,categories,isDraft'
@@ -737,8 +744,7 @@ export async function getThread(
       await Promise.all(
         ids.map(async (id) => {
           try {
-            const full = (await client
-              .api(resolveMessagePath(id))
+            const full = (await mailApi(client, resolveMessagePath(id))
               .select(
                 'id,conversationId,subject,bodyPreview,body,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,flag,importance,inferenceClassification,categories,isDraft'
               )
@@ -765,8 +771,7 @@ export async function getMessage(
 ): Promise<EmailMessage> {
   const account = await requireAccountForUser(userId, accountId);
   return withGraphRetry(account, async (client) => {
-    const full = (await client
-      .api(resolveMessagePath(messageId))
+    const full = (await mailApi(client, resolveMessagePath(messageId))
       .select(
         'id,conversationId,subject,bodyPreview,body,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,flag,importance,inferenceClassification,categories,isDraft'
       )
@@ -784,9 +789,10 @@ export async function getAttachment(
 ): Promise<string> {
   const account = await requireAccountForUser(userId, accountId);
   return withGraphRetry(account, async (client) => {
-    const att = (await client
-      .api(`${resolveMessagePath(messageId)}/attachments/${encodeURIComponent(attachmentId)}`)
-      .get()) as { contentBytes?: string };
+    const att = (await mailApi(
+      client,
+      `${resolveMessagePath(messageId)}/attachments/${encodeURIComponent(attachmentId)}`
+    ).get()) as { contentBytes?: string };
     return att.contentBytes || '';
   });
 }
@@ -814,7 +820,7 @@ export async function sendMessage(
       ccRecipients: asRecipientList(payload.cc),
       bccRecipients: asRecipientList(payload.bcc),
     };
-    await client.api('/me/sendMail').post({ message, saveToSentItems: true });
+    await mailApi(client, '/me/sendMail').post({ message, saveToSentItems: true });
     return true;
   });
   return { id: null, threadId: null };
@@ -829,7 +835,7 @@ export async function replyMessage(
   const account = await requireAccountForUser(userId, accountId);
   await withGraphRetry(account, async (client) => {
     // Docs: specify EITHER comment OR message.body — both together is a 400.
-    await client.api(`${resolveMessagePath(messageId)}/reply`).post({
+    await mailApi(client, `${resolveMessagePath(messageId)}/reply`).post({
       message: {
         body: {
           contentType: 'HTML',
@@ -850,18 +856,18 @@ export async function replyAllMessage(
 ): Promise<{ id: null; threadId: null }> {
   const account = await requireAccountForUser(userId, accountId);
   await withGraphRetry(account, async (client) => {
-    const created = (await client.api(`${resolveMessagePath(messageId)}/createReplyAll`).post({})) as {
+    const created = (await mailApi(client, `${resolveMessagePath(messageId)}/createReplyAll`).post({})) as {
       id?: string;
     };
     if (!created.id) throw new HttpError(502, 'Outlook createReplyAll did not return a draft id');
 
-    await client.api(resolveMessagePath(created.id)).patch({
+    await mailApi(client, resolveMessagePath(created.id)).patch({
       body: {
         contentType: 'HTML',
         content: payload.html || '<p></p>',
       },
     });
-    await client.api(`${resolveMessagePath(created.id)}/send`).post({});
+    await mailApi(client, `${resolveMessagePath(created.id)}/send`).post({});
     return true;
   });
   return { id: null, threadId: null };
@@ -918,14 +924,14 @@ export async function modifyMessage(
     if (addLabelIds.includes('STARRED')) patch.flag = { flagStatus: 'flagged' };
     if (removeLabelIds.includes('STARRED')) patch.flag = { flagStatus: 'notFlagged' };
     if (Object.keys(patch).length > 0) {
-      await client.api(resolveMessagePath(messageId)).patch(patch);
+      await mailApi(client, resolveMessagePath(messageId)).patch(patch);
     }
 
     if (addLabelIds.includes('INBOX')) {
       // Microsoft Graph: POST /me/messages/{id}/move { destinationId: "inbox" }
-      await client.api(`${resolveMessagePath(messageId)}/move`).post({ destinationId: 'inbox' });
+      await mailApi(client, `${resolveMessagePath(messageId)}/move`).post({ destinationId: 'inbox' });
     } else if (removeLabelIds.includes('INBOX')) {
-      await client.api(`${resolveMessagePath(messageId)}/move`).post({ destinationId: 'archive' });
+      await mailApi(client, `${resolveMessagePath(messageId)}/move`).post({ destinationId: 'archive' });
     }
     return true;
   });
@@ -983,16 +989,274 @@ export async function trashThreads(
       const ids = await resolveMessageIdsForThread(client, tid);
       for (const id of ids) {
         try {
-          await client.api(`${resolveMessagePath(id)}/move`).post({ destinationId: 'deleteditems' });
+          await mailApi(client, `${resolveMessagePath(id)}/move`).post({ destinationId: 'deleteditems' });
         } catch (err) {
           // Graph message ids change on move. If the token expires mid-loop,
           // withGraphRetry re-runs the whole batch and the already-moved
           // messages 404 under their old ids — that means done, not failed.
-          if (!isGraphNotFound(err)) throw err;
         }
       }
     }
     return true;
   });
   return { success: true };
+}
+
+export type OutlookSyncRemoval = {
+  folder: string;
+  conversationId: string;
+  messageId?: string;
+};
+
+export type OutlookSyncThread = EmailThreadListItem & {
+  mailboxLabels: string[];
+};
+
+type DeltaPage = {
+  value?: Array<
+    | (Parameters<typeof formatThreadListItem>[0] & { conversationId?: string })
+    | { id: string; '@removed'?: { reason?: string } }
+  >;
+  '@odata.nextLink'?: string;
+  '@odata.deltaLink'?: string;
+};
+
+function isGraphSyncStateGone(err: unknown): boolean {
+  const raw = err as { statusCode?: number; status?: number | string; code?: string };
+  return raw.statusCode === 410 || raw.status === 410 || raw.code === 'syncStateNotFound';
+}
+
+function groupDeltaMessages(
+  rows: Parameters<typeof formatThreadListItem>[0][]
+): EmailThreadListItem[] {
+  const grouped = new Map<string, ReturnType<typeof formatThreadListItem>[]>();
+  for (const msg of rows) {
+    const formatted = formatThreadListItem(msg);
+    const key = formatted.threadId;
+    const bucket = grouped.get(key) || [];
+    bucket.push(formatted);
+    grouped.set(key, bucket);
+  }
+
+  const threads: EmailThreadListItem[] = [];
+  for (const [threadId, items] of grouped.entries()) {
+    const sorted = [...items].sort((a, b) => {
+      const ta = new Date(a.date || 0).getTime();
+      const tb = new Date(b.date || 0).getTime();
+      return tb - ta;
+    });
+    const latest = sorted[0];
+    const oldest = sorted[sorted.length - 1];
+    threads.push({
+      ...latest,
+      id: threadId,
+      threadId,
+      firstMessageId: oldest.firstMessageId,
+      lastMessageId: latest.lastMessageId,
+      messageCount: sorted.length,
+      labelIds: [...new Set(sorted.flatMap((x) => x.labelIds || []))],
+      isUnread: sorted.some((x) => x.isUnread),
+    });
+  }
+
+  threads.sort((a, b) => {
+    const ta = new Date(a.date || 0).getTime();
+    const tb = new Date(b.date || 0).getTime();
+    return tb - ta;
+  });
+  return threads;
+}
+
+async function fetchDeltaPage(client: Client, url: string): Promise<DeltaPage> {
+  const request = url.startsWith('http') ? client.api(url) : mailApi(client, url);
+  return (await request.header('Prefer', IMMUTABLE_ID_PREFER).get()) as DeltaPage;
+}
+
+async function syncFolderDelta(
+  account: OutlookAccount,
+  userId: string,
+  folderWellKnown: string,
+  mailboxLabel: string
+): Promise<{
+  threads: OutlookSyncThread[];
+  removals: OutlookSyncRemoval[];
+  folderSyncAt: string;
+}> {
+  const existing = await OutlookSyncStateModel.findOne({
+    userId,
+    accountId: account.id,
+    folderWellKnown,
+  }).lean();
+
+  let deltaLink = existing?.deltaLink ?? null;
+  const deltaMessages: Parameters<typeof formatThreadListItem>[0][] = [];
+  const removals: OutlookSyncRemoval[] = [];
+
+  await withGraphRetry(account, async (client) => {
+    let nextUrl: string | null =
+      deltaLink ??
+      `/me/mailFolders/${encodeURIComponent(folderWellKnown)}/messages/delta?$select=${encodeURIComponent(DELTA_MESSAGE_SELECT)}`;
+    let retried = false;
+
+    while (nextUrl) {
+      let page: DeltaPage;
+      try {
+        page = await fetchDeltaPage(client, nextUrl);
+      } catch (err) {
+        if (!retried && isGraphSyncStateGone(err)) {
+          await OutlookSyncStateModel.updateOne(
+            { userId, accountId: account.id, folderWellKnown },
+            {
+              $set: {
+                deltaLink: null,
+                bootstrapComplete: false,
+                updatedAt: new Date().toISOString(),
+              },
+            }
+          );
+          deltaLink = null;
+          nextUrl = `/me/mailFolders/${encodeURIComponent(folderWellKnown)}/messages/delta?$select=${encodeURIComponent(DELTA_MESSAGE_SELECT)}`;
+          retried = true;
+          continue;
+        }
+        throw err;
+      }
+
+      for (const row of page.value || []) {
+        if ('@removed' in row && row['@removed']) {
+          removals.push({
+            folder: mailboxLabel,
+            conversationId: row.id,
+            messageId: row.id,
+          });
+          continue;
+        }
+        deltaMessages.push(row as Parameters<typeof formatThreadListItem>[0]);
+      }
+
+      if (page['@odata.nextLink']) {
+        nextUrl = page['@odata.nextLink'];
+      } else {
+        deltaLink = page['@odata.deltaLink'] ?? deltaLink;
+        nextUrl = null;
+      }
+    }
+  });
+
+  const folderSyncAt = new Date().toISOString();
+  await OutlookSyncStateModel.findOneAndUpdate(
+    { userId, accountId: account.id, folderWellKnown },
+    {
+      $set: {
+        deltaLink,
+        lastSyncAt: folderSyncAt,
+        bootstrapComplete: true,
+        updatedAt: folderSyncAt,
+      },
+    },
+    { upsert: true }
+  );
+
+  const threads = groupDeltaMessages(deltaMessages).map((thread) => ({
+    ...thread,
+    mailboxLabels: [mailboxLabel],
+  }));
+
+  return { threads, removals, folderSyncAt };
+}
+
+function orderSyncFolders(folders: string[]): string[] {
+  const unique = [...new Set(folders.filter(Boolean))];
+  return unique.sort((a, b) => {
+    if (a === 'INBOX') return -1;
+    if (b === 'INBOX') return 1;
+    if (a === 'SENT') return -1;
+    if (b === 'SENT') return 1;
+    return a.localeCompare(b);
+  });
+}
+
+export async function syncMailbox(
+  userId: string,
+  accountId: string,
+  opts: { folders?: string[]; mode?: 'delta' | 'bootstrap' } = {}
+): Promise<{
+  threads: OutlookSyncThread[];
+  removed: OutlookSyncRemoval[];
+  folderSyncAt: Record<string, string>;
+}> {
+  const account = await requireAccountForUser(userId, accountId);
+  const mode = opts.mode ?? 'delta';
+  const folderLabels = orderSyncFolders(
+    opts.folders?.length
+      ? opts.folders
+      : mode === 'delta'
+        ? ['INBOX']
+        : ALL_SYNC_FOLDER_LABELS
+  );
+
+  const threadMap = new Map<string, OutlookSyncThread>();
+  const removed: OutlookSyncRemoval[] = [];
+  const folderSyncAt: Record<string, string> = {};
+
+  for (const labelId of folderLabels) {
+    const wellKnown = FOLDER_MAP[labelId];
+    if (!wellKnown) continue;
+    const result = await syncFolderDelta(account, userId, wellKnown, labelId);
+    folderSyncAt[labelId] = result.folderSyncAt;
+    removed.push(...result.removals);
+
+    for (const thread of result.threads) {
+      const key = thread.threadId;
+      const existing = threadMap.get(key);
+      if (!existing) {
+        threadMap.set(key, thread);
+        continue;
+      }
+      const labels = new Set([...existing.mailboxLabels, ...thread.mailboxLabels]);
+      const incomingDate = thread.date ?? '';
+      const existingDate = existing.date ?? '';
+      if (incomingDate > existingDate) {
+        threadMap.set(key, { ...thread, mailboxLabels: [...labels] });
+      } else {
+        threadMap.set(key, { ...existing, mailboxLabels: [...labels] });
+      }
+    }
+  }
+
+  return {
+    threads: [...threadMap.values()],
+    removed,
+    folderSyncAt,
+  };
+}
+
+export async function getMailFolderStats(
+  userId: string,
+  accountId: string
+): Promise<
+  Record<string, { unreadItemCount: number; totalItemCount: number; loaded: true }>
+> {
+  const account = await requireAccountForUser(userId, accountId);
+  const stats: Record<string, { unreadItemCount: number; totalItemCount: number; loaded: true }> =
+    {};
+
+  await withGraphRetry(account, async (client) => {
+    for (const [labelId, wellKnown] of Object.entries(FOLDER_MAP)) {
+      try {
+        const folder = (await mailApi(client, `/me/mailFolders/${encodeURIComponent(wellKnown)}`)
+          .select('totalItemCount,unreadItemCount')
+          .get()) as { totalItemCount?: number; unreadItemCount?: number };
+        stats[labelId] = {
+          unreadItemCount: folder.unreadItemCount ?? 0,
+          totalItemCount: folder.totalItemCount ?? 0,
+          loaded: true,
+        };
+      } catch {
+        // folder may not exist on all tenants
+      }
+    }
+  });
+
+  return stats;
 }

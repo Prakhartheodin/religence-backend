@@ -9,6 +9,7 @@ import {
   disconnectOutlookAccount,
   forwardMessage,
   getAttachment,
+  getMailFolderStats,
   getMessage,
   getMicrosoftAuthUrl,
   getThread,
@@ -19,6 +20,7 @@ import {
   replyAllMessage,
   replyMessage,
   sendMessage,
+  syncMailbox,
   trashThreads,
 } from '../services/outlook.service.js';
 import {
@@ -144,6 +146,35 @@ emailRouter.get('/threads', async (req, res, next) => {
       query: optionalString(req.query.q),
     });
     res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.post('/sync', async (req, res, next) => {
+  try {
+    const accountId = asString(req.body?.accountId, 'accountId');
+    const folders = Array.isArray(req.body?.folders)
+      ? req.body.folders.map((f: unknown) => String(f || '').trim()).filter(Boolean)
+      : undefined;
+    const mode =
+      req.body?.mode === 'bootstrap' || req.body?.mode === 'delta'
+        ? req.body.mode
+        : undefined;
+    const result = await syncMailbox(requireUserId(req), accountId, { folders, mode });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+emailRouter.get('/folders/stats', async (req, res, next) => {
+  try {
+    const stats = await getMailFolderStats(
+      requireUserId(req),
+      asString(req.query.accountId, 'accountId')
+    );
+    res.json({ folders: stats });
   } catch (err) {
     next(err);
   }
