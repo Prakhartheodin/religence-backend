@@ -257,6 +257,19 @@ export const CrmEntities = {
     },
   }),
 
+  // Discrete notes attached to a lead. Distinct from Lead.notes (legacy free-text
+  // field still edited on the full lead form).
+  leadNotes: entityModel('LeadNote', {
+    collection: 'lead_notes',
+    fields: {
+      leadId: { type: String, default: '' },
+      body: { type: String, default: '' },
+      author: { type: String, default: '' },
+      createdAt: { type: Date },
+      updatedAt: { type: Date },
+    },
+  }),
+
   // Salts and medicines are NOT here: they are a shared catalogue, not per-user
   // lists. See models/catalogue.ts. Routing them through this per-user machinery
   // is what gave every user a private copy of the same 10 rows.
