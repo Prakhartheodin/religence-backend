@@ -46,7 +46,28 @@ const BRAND = {
   text: '#f4f0ff',
   muted: '#a89ec4',
   cream: '#f5efe4',
+  buttonText: '#ffffff',
 };
+
+/** Email-safe CTA: solid fills on both td and anchor (gradients get stripped in Gmail dark mode). */
+function renderCtaButton(ctaUrl: string, ctaLabel: string): string {
+  const { purple, purpleDeep, buttonText } = BRAND;
+  return `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 28px;">
+  <tr>
+    <td align="center" bgcolor="${purple}" style="border-radius:10px;background-color:${purple};background-image:linear-gradient(${purple},${purple});">
+      <!--[if mso]>
+      <v:roundrect xmlns:v="urn:schemas-microsoft-com:vml" xmlns:w="urn:schemas-microsoft-com:office:office" href="${ctaUrl}" style="height:48px;v-text-anchor:middle;width:240px;" arcsize="18%" stroke="f" fillcolor="${purple}">
+        <w:anchorlock/>
+        <center style="color:${buttonText};font-family:Segoe UI,Arial,sans-serif;font-size:15px;font-weight:600;">${ctaLabel}</center>
+      </v:roundrect>
+      <![endif]-->
+      <!--[if !mso]><!-->
+      <a href="${ctaUrl}" target="_blank" rel="noopener noreferrer" style="display:inline-block;min-width:180px;background-color:${purple};background-image:linear-gradient(${purple},${purple});border:1px solid ${purpleDeep};border-radius:10px;color:${buttonText} !important;font-family:'Segoe UI',system-ui,sans-serif;font-size:15px;font-weight:600;line-height:1.25;padding:14px 28px;text-align:center;text-decoration:none;-webkit-text-size-adjust:none;mso-hide:all;">${ctaLabel}</a>
+      <!--<![endif]-->
+    </td>
+  </tr>
+</table>`;
+}
 
 function emailShell(opts: {
   preheader: string;
@@ -90,13 +111,7 @@ function emailShell(opts: {
               <p style="margin:0 0 8px;font-family:'Segoe UI',system-ui,sans-serif;font-size:11px;font-weight:600;letter-spacing:0.14em;text-transform:uppercase;color:${BRAND.purple};">${eyebrow}</p>
               <h1 style="margin:0 0 16px;font-family:Georgia,'Palatino Linotype','Book Antiqua',serif;font-size:26px;font-weight:600;line-height:1.3;color:${BRAND.text};">${title}</h1>
               <p style="margin:0 0 28px;font-family:'Segoe UI',system-ui,sans-serif;font-size:16px;line-height:1.6;color:${BRAND.muted};">${body}</p>
-              <table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 28px;">
-                <tr>
-                  <td style="border-radius:10px;background:linear-gradient(135deg,${BRAND.purple} 0%,${BRAND.purpleDeep} 100%);">
-                    <a href="${ctaUrl}" style="display:inline-block;padding:14px 28px;font-family:'Segoe UI',system-ui,sans-serif;font-size:15px;font-weight:600;color:#ffffff;text-decoration:none;border-radius:10px;">${ctaLabel}</a>
-                  </td>
-                </tr>
-              </table>
+              ${renderCtaButton(ctaUrl, ctaLabel)}
               <p style="margin:0 0 8px;font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;line-height:1.5;color:${BRAND.muted};">If the button doesn't work, copy this link into your browser:</p>
               <p style="margin:0;padding:12px 14px;background-color:${BRAND.ink};border:1px solid ${BRAND.border};border-radius:8px;font-family:Consolas,'Courier New',monospace;font-size:12px;line-height:1.5;word-break:break-all;color:${BRAND.cream};"><a href="${ctaUrl}" style="color:${BRAND.cream};text-decoration:underline;">${ctaUrl}</a></p>
             </td>

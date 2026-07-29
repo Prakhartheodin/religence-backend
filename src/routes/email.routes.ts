@@ -28,6 +28,9 @@ import {
 
 export const emailRouter = Router();
 
+// CRM mail (inbox, send, reply) is Outlook Graph only. Auth transactional mail
+// (verify/reset) uses services/mailer.ts separately.
+
 emailRouter.use(requireAuth);
 
 function requireUserId(req: Request): string {
