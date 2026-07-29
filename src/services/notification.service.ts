@@ -42,14 +42,6 @@ const NOTIFICATION_TYPE_CONFIG: Record<
   quotation_logged: { category: 'activity', icon: 'file-invoice' },
 };
 
-function newNotificationId(): string {
-  return `ntf-${randomUUID()}`;
-}
-
-function toDocument(doc: { toJSON(): NotificationDocument }): NotificationDocument {
-  return doc.toJSON();
-}
-
 async function getDismissal(
   userId: string,
   dedupeKey: string
@@ -89,7 +81,7 @@ async function emit(input: EmitInput): Promise<NotificationDocument | null> {
       existing.meta = input.meta;
       existing.updatedAt = now;
       await existing.save();
-      return toDocument(existing);
+      return existing.toJSON() as NotificationDocument;
     }
 
     // Create path: gate client dedupe types against dismissals (mirrors scan skip)
@@ -109,7 +101,7 @@ async function emit(input: EmitInput): Promise<NotificationDocument | null> {
   }
 
   const created = await NotificationModel.create({
-    id: newNotificationId(),
+    id: `ntf-${randomUUID()}`,
     userId: input.userId,
     type: input.type,
     category,
@@ -122,7 +114,7 @@ async function emit(input: EmitInput): Promise<NotificationDocument | null> {
     createdAt: now,
     updatedAt: now,
   });
-  return toDocument(created);
+  return created.toJSON() as NotificationDocument;
 }
 
 async function clearByDedupeKey(userId: string, dedupeKey: string): Promise<void> {
@@ -145,7 +137,7 @@ async function listForUser(
     const docs = await NotificationModel.find({ userId, category: opts.category })
       .sort({ createdAt: -1 })
       .limit(limit);
-    return { items: docs.map(toDocument), total, activityTotal };
+    return { items: docs.map((doc) => doc.toJSON() as NotificationDocument), total, activityTotal };
   }
 
   // No category filter: fetch both buckets, merge-sort action-first, THEN cap
@@ -158,7 +150,7 @@ async function listForUser(
       .limit(limit),
   ]);
 
-  const items = [...actionDocs.map(toDocument), ...activityDocs.map(toDocument)]
+  const items = [...actionDocs.map((doc) => doc.toJSON() as NotificationDocument), ...activityDocs.map((doc) => doc.toJSON() as NotificationDocument)]
     .sort((a, b) => {
       const catOrder = (c: NotificationCategory) => (c === 'action' ? 0 : 1);
       const byCat = catOrder(a.category) - catOrder(b.category);
@@ -243,11 +235,6 @@ async function clearDismissal(userId: string, dedupeKey: string): Promise<void> 
   await NotificationDismissalModel.deleteOne({ userId, dedupeKey });
 }
 
-async function hasDismissal(userId: string, dedupeKey: string): Promise<boolean> {
-  const doc = await NotificationDismissalModel.exists({ userId, dedupeKey });
-  return doc !== null;
-}
-
 /** Pure: should scan skip emit because dismissal still covers current count? */
 function shouldSkipVerificationEmit(
   count: number,
@@ -274,7 +261,6 @@ function shouldSkipClientEmitCreate(
   return false;
 }
 
-/** Phase 1a: verification_pending only. Phase 1b adds follow_up_due here. */
 async function scanVerificationPending(userId: string): Promise<void> {
   const dedupeKey = 'verification_pending';
   const LeadModel = CrmEntities.leads;
@@ -301,10 +287,6 @@ async function scanVerificationPending(userId: string): Promise<void> {
     dedupeKey,
     meta: { count },
   });
-}
-
-async function scanForUser(userId: string): Promise<void> {
-  await scanVerificationPending(userId);
 }
 
 function assertClientEmitAllowed(type: NotificationType): void {
@@ -346,18 +328,11 @@ function deriveEmitFromClientBody(
 
 export const notificationService = {
   emit,
-  clearByDedupeKey,
   listForUser,
   deleteForUser,
   deleteByDedupeKey,
-  recordDismissal,
-  clearDismissal,
-  hasDismissal,
-  scanForUser,
+  scanVerificationPending,
   deriveEmitFromClientBody,
-  shouldSkipVerificationEmit,
-  shouldSkipClientEmitCreate,
-  NOTIFICATION_TYPE_CONFIG,
 };
 
 // ponytail: assert self-check — run with `npx tsx src/services/notification.service.ts`

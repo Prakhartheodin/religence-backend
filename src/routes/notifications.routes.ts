@@ -32,7 +32,7 @@ notificationsRouter.get('/', async (req, res, next) => {
 
 notificationsRouter.post('/scan', async (req, res, next) => {
   try {
-    await notificationService.scanForUser(uid(req));
+    await notificationService.scanVerificationPending(uid(req));
     res.json({ scanned: true });
   } catch (err) {
     next(err);
