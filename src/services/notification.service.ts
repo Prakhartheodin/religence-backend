@@ -173,9 +173,10 @@ async function deleteForUser(
   const dedupeKey = doc.dedupeKey;
   const category = doc.category as NotificationCategory;
 
-  // Record/clear dismissal BEFORE deleting row — prevents dismiss+scan race
+  // Record/clear dismissal BEFORE deleting row — prevents delete+scan race
   if (dedupeKey) {
-    if (intent === 'dismiss' && category === 'action') {
+    if (category === 'action' && (intent === 'dismiss' || intent === 'navigate')) {
+      // ponytail: navigate on deduped action types = ack + delete (same as X dismiss)
       const dismissedCount =
         doc.type === 'verification_pending' ? doc.meta?.count : undefined;
       const dismissedMessageId =
