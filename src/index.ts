@@ -8,6 +8,7 @@ import { authRouter } from './routes/auth.routes.js';
 import { crmRouter } from './routes/crm.routes.js';
 import { emailRouter } from './routes/email.routes.js';
 import { masterDataRouter } from './routes/master-data.routes.js';
+import { notificationsRouter } from './routes/notifications.routes.js';
 
 const app = express();
 
@@ -18,6 +19,7 @@ app.use('/v1/auth', authRouter);
 app.use('/v1/email', emailRouter);
 app.use('/v1/master-data', requireAuth, masterDataRouter);
 app.use('/v1/crm', requireAuth, crmRouter);
+app.use('/v1/notifications', requireAuth, notificationsRouter);
 
 app.get('/health', (_req, res) => {
   res.json({
