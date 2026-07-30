@@ -34,6 +34,7 @@ const NOTIFICATION_TYPE_CONFIG: Record<
 > = {
   verification_pending: { category: 'action', icon: 'user-check' },
   follow_up_due: { category: 'action', icon: 'calendar-event' },
+  follow_up_logged: { category: 'activity', icon: 'calendar-plus' },
   inbound_email: { category: 'action', icon: 'mail' },
   outlook_error: { category: 'action', icon: 'alert-circle' },
   lead_verified: { category: 'activity', icon: 'circle-check' },
@@ -340,6 +341,9 @@ export const notificationService = {
 if (process.argv[1]?.endsWith('notification.service.ts')) {
   assert.equal(NOTIFICATION_TYPE_CONFIG.verification_pending.category, 'action');
   assert.equal(NOTIFICATION_TYPE_CONFIG.verification_pending.icon, 'user-check');
+  assert.equal(NOTIFICATION_TYPE_CONFIG.sample_logged.category, 'activity');
+  assert.equal(NOTIFICATION_TYPE_CONFIG.quotation_logged.category, 'activity');
+  assert.equal(NOTIFICATION_TYPE_CONFIG.follow_up_logged.category, 'activity');
 
   // scan dismissal math
   assert.equal(shouldSkipVerificationEmit(3, 3), true);

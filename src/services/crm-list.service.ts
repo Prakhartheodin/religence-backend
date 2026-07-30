@@ -1,7 +1,57 @@
+import assert from 'node:assert/strict';
 import { HttpError } from '../http-error.js';
 import { CrmEntities, type CrmEntityName } from '../models/crm-entities.js';
 import { recordChanges, type ChangeEntry } from './change-log.service.js';
 import { parseListItems } from './crm-list.util.js';
+import { notificationService, type EmitInput } from './notification.service.js';
+
+/** Activity notification to raise when a brand-new item lands in one of these lists. */
+function loggedNotificationInput(
+  entity: CrmEntityName,
+  userId: string,
+  after: Record<string, unknown>
+): EmitInput | null {
+  const leadId = String(after.leadId ?? '');
+  const href = `/active-leads/${leadId}`;
+  const companyName = typeof after.companyName === 'string' ? after.companyName : '';
+
+  switch (entity) {
+    case 'samples':
+      return {
+        userId,
+        type: 'sample_logged',
+        title: after.product ? `Sample recorded: ${after.product}` : 'Sample recorded',
+        body: companyName ? `For ${companyName}.` : 'New sample logged.',
+        href,
+        icon: 'package',
+        meta: { leadId },
+      };
+    case 'quotations':
+      return {
+        userId,
+        type: 'quotation_logged',
+        title: after.quoteNo ? `Quotation ${after.quoteNo} created` : 'Quotation created',
+        body: companyName ? `For ${companyName}.` : 'New quotation created.',
+        href,
+        icon: 'file-invoice',
+        meta: { leadId, quoteNo: String(after.quoteNo ?? '') },
+      };
+    case 'followUps': {
+      const summary = typeof after.summary === 'string' ? after.summary.trim() : '';
+      return {
+        userId,
+        type: 'follow_up_logged',
+        title: 'Follow-up logged',
+        body: summary ? summary.slice(0, 120) : 'New follow-up added.',
+        href,
+        icon: 'calendar-plus',
+        meta: { leadId },
+      };
+    }
+    default:
+      return null;
+  }
+}
 
 export type CrmListService = {
   get: (userId: string) => Promise<Record<string, unknown>[]>;
@@ -126,7 +176,54 @@ export function crmList(entity: CrmEntityName): CrmListService {
 
       await recordChanges(changes);
 
+      // Best-effort: the save above already committed, so a notification
+      // failure is warned and swallowed rather than failing the user's request.
+      try {
+        for (const change of changes) {
+          if (change.op !== 'create') continue;
+          const input = loggedNotificationInput(
+            entity,
+            userId,
+            change.after as Record<string, unknown>
+          );
+          if (input) await notificationService.emit(input);
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[crm-list] failed to emit activity notification:', err);
+      }
+
       return this.get(userId);
     },
   };
+}
+
+// ponytail: assert self-check — run with `npx tsx src/services/crm-list.service.ts`
+if (process.argv[1]?.endsWith('crm-list.service.ts')) {
+  const sample = loggedNotificationInput('samples', 'u1', {
+    leadId: 'lead-1',
+    product: 'Amoxicillin',
+    companyName: 'Acme Pharma',
+  });
+  assert.equal(sample?.type, 'sample_logged');
+  assert.equal(sample?.href, '/active-leads/lead-1');
+
+  const quotation = loggedNotificationInput('quotations', 'u1', {
+    leadId: 'lead-2',
+    quoteNo: 'Q-100',
+    companyName: 'Beta Labs',
+  });
+  assert.equal(quotation?.type, 'quotation_logged');
+  assert.equal(quotation?.meta?.quoteNo, 'Q-100');
+
+  const followUp = loggedNotificationInput('followUps', 'u1', {
+    leadId: 'lead-3',
+    summary: 'Discussed pricing',
+  });
+  assert.equal(followUp?.type, 'follow_up_logged');
+  assert.equal(followUp?.body, 'Discussed pricing');
+
+  assert.equal(loggedNotificationInput('leads', 'u1', {}), null);
+
+  console.log('crm-list.service self-check passed');
 }
