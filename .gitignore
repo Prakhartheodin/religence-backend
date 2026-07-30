@@ -3,3 +3,9 @@ dist
 .env
 data/
 .env.bak*
+
+# internal scripts / tests
+scripts/
+**/*.test.*
+**/*.spec.*
+__tests__/
