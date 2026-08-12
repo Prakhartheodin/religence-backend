@@ -806,9 +806,20 @@ export async function sendMessage(
     bcc?: string | string[];
     subject?: string;
     html?: string;
+    attachments?: Array<{ name?: string; contentType?: string; contentBytes?: string }>;
   }
 ): Promise<{ id: null; threadId: null }> {
   const account = await requireAccountForUser(userId, accountId);
+  const attachments = (Array.isArray(payload.attachments) ? payload.attachments : []).filter(
+    (att) => typeof att?.contentBytes === 'string' && att.contentBytes.length > 0
+  );
+  // Graph sendMail caps the whole request around 4MB — larger files need an
+  // upload session on a draft. ponytail: hard-reject; add upload sessions if
+  // users ever need >3MB attachments.
+  const totalBase64 = attachments.reduce((sum, att) => sum + (att.contentBytes as string).length, 0);
+  if (totalBase64 > 4 * 1024 * 1024) {
+    throw new HttpError(413, 'Attachments too large — keep the combined size under 3MB.');
+  }
   await withGraphRetry(account, async (client) => {
     const message = {
       subject: payload.subject || '',
@@ -819,6 +830,16 @@ export async function sendMessage(
       toRecipients: asRecipientList(payload.to),
       ccRecipients: asRecipientList(payload.cc),
       bccRecipients: asRecipientList(payload.bcc),
+      ...(attachments.length
+        ? {
+            attachments: attachments.map((att) => ({
+              '@odata.type': '#microsoft.graph.fileAttachment',
+              name: att.name || 'attachment',
+              contentType: att.contentType || 'application/octet-stream',
+              contentBytes: att.contentBytes,
+            })),
+          }
+        : {}),
     };
     await mailApi(client, '/me/sendMail').post({ message, saveToSentItems: true });
     return true;

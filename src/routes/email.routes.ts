@@ -233,6 +233,7 @@ emailRouter.post('/messages/send', async (req, res, next) => {
       bcc: req.body.bcc,
       subject: req.body.subject,
       html: req.body.html,
+      attachments: req.body.attachments,
     });
     res.status(201).json(result);
   } catch (err) {
