@@ -14,6 +14,10 @@ import {
   upsertOutlookAccount,
 } from './outlook-store.js';
 import { OutlookSyncStateModel } from '../models/outlook-sync-state.model.js';
+import {
+  normalizeMailAttachments,
+  type MailAttachmentInput,
+} from './mail-attachments.js';
 import type { EmailAccountPublic, EmailMessage, EmailThreadListItem, OutlookAccount } from '../types/email.js';
 
 const SCOPES = [
@@ -797,6 +801,44 @@ export async function getAttachment(
   });
 }
 
+type ReplyPayload = {
+  html?: string;
+  cc?: string | string[];
+  bcc?: string | string[];
+  attachments?: MailAttachmentInput[];
+};
+
+async function finalizeReplyDraft(
+  client: Client,
+  draftId: string,
+  payload: ReplyPayload
+): Promise<void> {
+  const attachments = normalizeMailAttachments(payload.attachments);
+  const patch: Record<string, unknown> = {
+    body: {
+      contentType: 'HTML',
+      content: payload.html || '<p></p>',
+    },
+  };
+  const cc = asRecipientList(payload.cc);
+  const bcc = asRecipientList(payload.bcc);
+  if (cc.length) patch.ccRecipients = cc;
+  if (bcc.length) patch.bccRecipients = bcc;
+
+  await mailApi(client, resolveMessagePath(draftId)).patch(patch);
+
+  for (const att of attachments) {
+    await mailApi(client, `${resolveMessagePath(draftId)}/attachments`).post({
+      '@odata.type': '#microsoft.graph.fileAttachment',
+      name: att.name,
+      contentType: att.contentType,
+      contentBytes: att.contentBytes,
+    });
+  }
+
+  await mailApi(client, `${resolveMessagePath(draftId)}/send`).post({});
+}
+
 export async function sendMessage(
   userId: string,
   accountId: string,
@@ -806,20 +848,11 @@ export async function sendMessage(
     bcc?: string | string[];
     subject?: string;
     html?: string;
-    attachments?: Array<{ name?: string; contentType?: string; contentBytes?: string }>;
+    attachments?: MailAttachmentInput[];
   }
 ): Promise<{ id: null; threadId: null }> {
   const account = await requireAccountForUser(userId, accountId);
-  const attachments = (Array.isArray(payload.attachments) ? payload.attachments : []).filter(
-    (att) => typeof att?.contentBytes === 'string' && att.contentBytes.length > 0
-  );
-  // Graph sendMail caps the whole request around 4MB — larger files need an
-  // upload session on a draft. ponytail: hard-reject; add upload sessions if
-  // users ever need >3MB attachments.
-  const totalBase64 = attachments.reduce((sum, att) => sum + (att.contentBytes as string).length, 0);
-  if (totalBase64 > 4 * 1024 * 1024) {
-    throw new HttpError(413, 'Attachments too large — keep the combined size under 3MB.');
-  }
+  const attachments = normalizeMailAttachments(payload.attachments);
   await withGraphRetry(account, async (client) => {
     const message = {
       subject: payload.subject || '',
@@ -834,8 +867,8 @@ export async function sendMessage(
         ? {
             attachments: attachments.map((att) => ({
               '@odata.type': '#microsoft.graph.fileAttachment',
-              name: att.name || 'attachment',
-              contentType: att.contentType || 'application/octet-stream',
+              name: att.name,
+              contentType: att.contentType,
               contentBytes: att.contentBytes,
             })),
           }
@@ -851,19 +884,18 @@ export async function replyMessage(
   userId: string,
   accountId: string,
   messageId: string,
-  payload: { html?: string }
+  payload: ReplyPayload
 ): Promise<{ id: null; threadId: null }> {
   const account = await requireAccountForUser(userId, accountId);
+  // Fail fast on oversized attachments before createReply.
+  normalizeMailAttachments(payload.attachments);
   await withGraphRetry(account, async (client) => {
-    // Docs: specify EITHER comment OR message.body — both together is a 400.
-    await mailApi(client, `${resolveMessagePath(messageId)}/reply`).post({
-      message: {
-        body: {
-          contentType: 'HTML',
-          content: payload.html || '<p></p>',
-        },
-      },
-    });
+    // createReply → patch → attach → send (instant /reply can't carry file attachments).
+    const created = (await mailApi(client, `${resolveMessagePath(messageId)}/createReply`).post({})) as {
+      id?: string;
+    };
+    if (!created.id) throw new HttpError(502, 'Outlook createReply did not return a draft id');
+    await finalizeReplyDraft(client, created.id, payload);
     return true;
   });
   return { id: null, threadId: null };
@@ -873,22 +905,16 @@ export async function replyAllMessage(
   userId: string,
   accountId: string,
   messageId: string,
-  payload: { html?: string }
+  payload: ReplyPayload
 ): Promise<{ id: null; threadId: null }> {
   const account = await requireAccountForUser(userId, accountId);
+  normalizeMailAttachments(payload.attachments);
   await withGraphRetry(account, async (client) => {
     const created = (await mailApi(client, `${resolveMessagePath(messageId)}/createReplyAll`).post({})) as {
       id?: string;
     };
     if (!created.id) throw new HttpError(502, 'Outlook createReplyAll did not return a draft id');
-
-    await mailApi(client, resolveMessagePath(created.id)).patch({
-      body: {
-        contentType: 'HTML',
-        content: payload.html || '<p></p>',
-      },
-    });
-    await mailApi(client, `${resolveMessagePath(created.id)}/send`).post({});
+    await finalizeReplyDraft(client, created.id, payload);
     return true;
   });
   return { id: null, threadId: null };

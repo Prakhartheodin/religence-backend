@@ -249,6 +249,9 @@ emailRouter.post('/messages/:id/reply', async (req, res, next) => {
       asString(req.params.id, 'id'),
       {
         html: req.body.html,
+        cc: req.body.cc,
+        bcc: req.body.bcc,
+        attachments: req.body.attachments,
       }
     );
     res.status(201).json(result);
@@ -265,6 +268,9 @@ emailRouter.post('/messages/:id/reply-all', async (req, res, next) => {
       asString(req.params.id, 'id'),
       {
         html: req.body.html,
+        cc: req.body.cc,
+        bcc: req.body.bcc,
+        attachments: req.body.attachments,
       }
     );
     res.status(201).json(result);
