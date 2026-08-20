@@ -19,6 +19,7 @@ import {
   type MailAttachmentInput,
 } from './mail-attachments.js';
 import type { EmailAccountPublic, EmailMessage, EmailThreadListItem, OutlookAccount } from '../types/email.js';
+import { promoteDraftsAfterReconnect } from './mail-workflow/workflow.service.js';
 
 const SCOPES = [
   'openid',
@@ -559,6 +560,11 @@ export async function handleMicrosoftCallback(
     accessToken: tokenResponse.accessToken,
     refreshToken,
     tokenExpiry,
+  });
+
+  void promoteDraftsAfterReconnect(parsed.userId).catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error('[outlook] promoteDraftsAfterReconnect failed:', err);
   });
 
   return {

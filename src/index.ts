@@ -12,6 +12,7 @@ import { inboxRouter } from './routes/inbox.routes.js';
 import { masterDataRouter } from './routes/master-data.routes.js';
 import { notificationsRouter } from './routes/notifications.routes.js';
 import { executionsRouter, workflowsRouter } from './routes/workflows.routes.js';
+import { runSchedulerTick } from './services/mail-workflow/scheduler.js';
 
 const app = express();
 
@@ -50,6 +51,17 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   });
 });
 
+function startSchedulerLoop(): void {
+  const tick = () => {
+    void runSchedulerTick().catch((err) => {
+      // eslint-disable-next-line no-console
+      console.error('[religence-backend] scheduler tick failed:', err);
+    });
+  };
+  tick();
+  setInterval(tick, 30_000);
+}
+
 async function startServer(): Promise<void> {
   try {
     await connectMongo();
@@ -57,6 +69,7 @@ async function startServer(): Promise<void> {
       // eslint-disable-next-line no-console
       console.log(`[religence-backend] listening on http://localhost:${config.port}`);
     });
+    startSchedulerLoop();
 
     server.on('error', (err) => {
       // eslint-disable-next-line no-console

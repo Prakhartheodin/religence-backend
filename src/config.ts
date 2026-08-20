@@ -34,6 +34,11 @@ export const config = {
     tenantId: process.env.MICROSOFT_TENANT_ID ?? 'common',
   },
   workflowTimezone: process.env.WORKFLOW_TIMEZONE?.trim() || 'Asia/Kolkata',
+  chatLlm: {
+    apiKey: (process.env.CHAT_LLM_API_KEY ?? '').trim(),
+    baseUrl: (process.env.CHAT_LLM_BASE_URL ?? 'https://api.openai.com/v1').replace(/\/$/, ''),
+    model: (process.env.CHAT_LLM_MODEL ?? 'gpt-4o-mini').trim(),
+  },
 };
 
 export default config;
