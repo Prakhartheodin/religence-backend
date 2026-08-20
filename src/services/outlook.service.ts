@@ -52,8 +52,10 @@ const IMMUTABLE_ID_PREFER = 'IdType="ImmutableId"';
 const DELTA_MESSAGE_SELECT =
   'id,conversationId,subject,bodyPreview,from,toRecipients,receivedDateTime,sentDateTime,isRead,flag,importance,inferenceClassification,categories,isDraft';
 
-function mailApi(client: Client, path: string) {
-  return client.api(path).header('Prefer', IMMUTABLE_ID_PREFER);
+function mailApi(client: Client, path: string, extraHeaders?: Record<string, string>) {
+  let req = client.api(path).header('Prefer', IMMUTABLE_ID_PREFER);
+  if (extraHeaders) for (const [k, v] of Object.entries(extraHeaders)) req = req.header(k, v);
+  return req;
 }
 
 function ensureOutlookConfigured(): void {
@@ -849,6 +851,7 @@ export async function sendMessage(
     subject?: string;
     html?: string;
     attachments?: MailAttachmentInput[];
+    idempotencyKey?: string;
   }
 ): Promise<{ id: null; threadId: null }> {
   const account = await requireAccountForUser(userId, accountId);
@@ -873,8 +876,16 @@ export async function sendMessage(
             })),
           }
         : {}),
+      ...(payload.idempotencyKey
+        ? {
+            internetMessageId: `<${payload.idempotencyKey.replace(/[^a-zA-Z0-9._-]/g, '.')}@religance.local>`,
+          }
+        : {}),
     };
-    await mailApi(client, '/me/sendMail').post({ message, saveToSentItems: true });
+    const sendPath = payload.idempotencyKey
+      ? mailApi(client, '/me/sendMail', { 'client-request-id': payload.idempotencyKey })
+      : mailApi(client, '/me/sendMail');
+    await sendPath.post({ message, saveToSentItems: true });
     return true;
   });
   return { id: null, threadId: null };
