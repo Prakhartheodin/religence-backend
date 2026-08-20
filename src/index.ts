@@ -5,10 +5,13 @@ import { connectMongo } from './db/mongo.js';
 import { HttpError } from './http-error.js';
 import { requireAuth } from './middleware/require-auth.js';
 import { authRouter } from './routes/auth.routes.js';
+import { chatRouter } from './routes/chat.routes.js';
 import { crmRouter } from './routes/crm.routes.js';
 import { emailRouter } from './routes/email.routes.js';
+import { inboxRouter } from './routes/inbox.routes.js';
 import { masterDataRouter } from './routes/master-data.routes.js';
 import { notificationsRouter } from './routes/notifications.routes.js';
+import { executionsRouter, workflowsRouter } from './routes/workflows.routes.js';
 
 const app = express();
 
@@ -20,6 +23,10 @@ app.use('/v1/email', emailRouter);
 app.use('/v1/master-data', requireAuth, masterDataRouter);
 app.use('/v1/crm', requireAuth, crmRouter);
 app.use('/v1/notifications', requireAuth, notificationsRouter);
+app.use('/v1/chat', requireAuth, chatRouter);
+app.use('/v1/workflows', requireAuth, workflowsRouter);
+app.use('/v1/executions', requireAuth, executionsRouter);
+app.use('/v1/inbox', requireAuth, inboxRouter);
 
 app.get('/health', (_req, res) => {
   res.json({

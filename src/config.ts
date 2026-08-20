@@ -33,6 +33,7 @@ export const config = {
       `http://localhost:${port}/v1/email/auth/microsoft/callback`,
     tenantId: process.env.MICROSOFT_TENANT_ID ?? 'common',
   },
+  workflowTimezone: process.env.WORKFLOW_TIMEZONE?.trim() || 'Asia/Kolkata',
 };
 
 export default config;
