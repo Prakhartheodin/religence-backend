@@ -71,7 +71,7 @@ import {
   slashSendMessage,
   slashUnknownMessage,
 } from './slash-commands.js';
-import { isImmediatePhrase, parseWhen } from './chat-time.js';
+import { isImmediatePhrase, parseTimeCorrection, parseWhen } from './chat-time.js';
 import { mailLog } from './log.js';
 import {
   buildDraftPreview,
@@ -214,7 +214,7 @@ function isDeliveryStatusQuery(text: string): boolean {
  * as a schedule change and never reached the template matcher.
  */
 const TIME_TOKEN =
-  /\b(\d{1,2}(:\d{2})?\s*(am|pm)|\d{1,2}:\d{2}|daily|weekly|monthly|monday|tuesday|wednesday|thursday|friday|saturday|sunday|every|tomorrow|today|tonight|now|asap|noon|midnight)\b/;
+  /\b(\d{1,2}(:\d{2})?\s*(am|pm)|\d{1,2}:\d{2}|\d{1,2}\s+(?:in\s+(?:the\s+)?)?(morning|afternoon|evening)|daily|weekly|monthly|monday|tuesday|wednesday|thursday|friday|saturday|sunday|every|tomorrow|today|tonight|now|asap|noon|midnight)\b/;
 
 const ORDINAL_WORDS: Record<string, number> = {
   first: 1, second: 2, third: 3, fourth: 4, fifth: 5,
@@ -509,6 +509,12 @@ const WORD_COUNTS: Record<string, number> = {
   one: 1, two: 2, three: 3, four: 4, five: 5, twice: 2, thrice: 3,
 };
 
+function parseCountToken(raw: string): number | null {
+  if (!raw) return null;
+  if (/^\d{1,2}$/.test(raw)) return Number.parseInt(raw, 10);
+  return WORD_COUNTS[raw] ?? null;
+}
+
 function parseSequenceCount(text: string): number | null {
   const t = normalize(text);
   if (/\b(?:a few|several|some)\b/.test(t)) return null;
@@ -521,6 +527,13 @@ function parseSequenceCount(text: string): number | null {
     if (t === word) return n;
   }
   return null;
+}
+
+function parseAdditionalSequenceCount(text: string): number | null {
+  const t = normalize(text);
+  const m = t.match(/\badd\s+(\d{1,2}|one|two|three|four|five|twice|thrice)\s+more\s+(?:mails?|emails?|times|sends)\b/);
+  if (!m) return null;
+  return parseCountToken(m[1]);
 }
 
 function recurringCadenceIntent(text: string): 'recurring' | 'clarify' | null {
@@ -605,6 +618,7 @@ function specsFromGap(count: number, gapMinutes: number, anchor: 'now' | 'after_
 
 function mergeSequenceSpec(base: SequenceSpec | undefined, patch: SequenceSpec): SequenceSpec {
   return {
+    startAt: patch.startAt ?? base?.startAt,
     anchor: patch.anchor ?? base?.anchor,
     count: patch.count ?? base?.count,
     sameDay: patch.sameDay ?? base?.sameDay,
@@ -615,6 +629,9 @@ function mergeSequenceSpec(base: SequenceSpec | undefined, patch: SequenceSpec):
 
 function extractSequenceSpecFromRaw(raw: Record<string, unknown>): SequenceSpec {
   const spec: SequenceSpec = { steps: [] };
+  const startAt = String(raw.startAt ?? '').trim();
+  const startAtDate = new Date(startAt);
+  if (startAt && !Number.isNaN(startAtDate.getTime())) spec.startAt = startAtDate.toISOString();
   if (raw.sameDay === true) spec.sameDay = true;
   const gap = parseIntervalGapMinutes(JSON.stringify(raw));
   if (gap) spec.gapMinutes = gap;
@@ -683,7 +700,7 @@ function previousInstantForStep(
   stepIndex: number,
   timezone: string,
 ): Date {
-  const startAt = new Date();
+  const startAt = spec.startAt ? new Date(spec.startAt) : new Date();
   if (spec.anchor === 'after_gap' && spec.gapMinutes) {
     return new Date(startAt.getTime() + spec.gapMinutes * 60_000);
   }
@@ -777,7 +794,8 @@ function tryMaterializeSequenceDraft(draft: ConversationDraft, timezone: string)
   const spec = draft.sequenceSpec;
   if (!spec || nextAmbiguity(draft)) return null;
 
-  let startAt = new Date();
+  let startAt = spec.startAt ? new Date(spec.startAt) : new Date();
+  if (Number.isNaN(startAt.getTime())) startAt = new Date();
   let specs: StepSpec[] = [];
 
   if (spec.gapMinutes != null && spec.count != null && spec.anchor) {
@@ -963,7 +981,7 @@ function parseChainedSequenceSteps(text: string): RawStep[] | null {
     });
   }
 
-  for (const m of t.matchAll(/\b(\d+|one|two|three|four|five)\s+hours?\s+later\b/g)) {
+  for (const m of t.matchAll(/\b(\d+|one|two|three|four|five)\s+hours?\s+(?:later|after(?:\s+(?:the\s+)?)?(?:first|previous|last|that|this|it)(?:\s+one)?)\b/g)) {
     const raw = m[1];
     const n = /\d/.test(raw) ? Number.parseInt(raw, 10) : SEQ_HOUR_WORDS[raw];
     if (!n || n < 1 || n > 168) continue;
@@ -1086,6 +1104,72 @@ function applyChainedStepFallback(draft: ConversationDraft, text: string): void 
     merged.push(fallback[i]);
   }
   spec.steps = assign(merged);
+}
+
+function existingSequenceSendCount(draft: ConversationDraft): number {
+  if (draft.schedule?.frequency === 'once') return 1;
+  if (draft.schedule?.frequency === 'sequence') return draft.schedule.steps?.length ?? 0;
+  if (draft.sequenceSpec?.count != null) return draft.sequenceSpec.count;
+  return draft.sequenceSpec?.steps.length ?? 0;
+}
+
+function materializedSequenceSpecFromDraft(draft: ConversationDraft): SequenceSpec | null {
+  if (draft.schedule?.frequency === 'once') {
+    const runAtDate = new Date(draft.schedule.runAt ?? Date.now());
+    const runAt = Number.isNaN(runAtDate.getTime()) ? new Date().toISOString() : runAtDate.toISOString();
+    return {
+      startAt: runAt,
+      count: 1,
+      steps: [
+        {
+          spec: { kind: 'after', minutes: 0, from: 'start' },
+          ...(draft.templateId ? { templateId: draft.templateId } : {}),
+        },
+      ],
+    };
+  }
+  if (draft.schedule?.frequency === 'sequence') {
+    const steps = draft.schedule.steps ?? [];
+    if (!steps.length) return null;
+    const startAtDate = new Date(draft.schedule.startAt ?? Date.now());
+    const startAt = Number.isNaN(startAtDate.getTime()) ? new Date().toISOString() : startAtDate.toISOString();
+    return {
+      startAt,
+      count: steps.length,
+      steps: steps.map((step) => ({
+        spec: step.spec,
+        ...(step.templateId ? { templateId: step.templateId } : {}),
+      })),
+    };
+  }
+  return null;
+}
+
+function applyAddMoreSequenceIntent(draft: ConversationDraft, text: string): boolean {
+  const addCount = parseAdditionalSequenceCount(text);
+  if (addCount == null || addCount < 1) return false;
+
+  const existingCount = existingSequenceSendCount(draft);
+  if (existingCount < 1) return false;
+
+  if (!draft.sequenceSpec) {
+    const seeded = materializedSequenceSpecFromDraft(draft);
+    if (seeded) {
+      draft.sequenceSpec = seeded;
+      draft.schedule = undefined;
+    } else {
+      draft.sequenceSpec = { steps: [] };
+    }
+  }
+  const spec = draft.sequenceSpec;
+  if (!spec) return false;
+
+  const targetCount = Math.min(MAX_SEQUENCE_STEPS, existingCount + addCount);
+  const extras = parseChainedSequenceSteps(text) ?? [];
+  const room = Math.max(0, targetCount - spec.steps.length);
+  if (room && extras.length) spec.steps.push(...extras.slice(0, room));
+  spec.count = targetCount;
+  return true;
 }
 
 function seedSequenceFromText(draft: ConversationDraft, text: string): void {
@@ -1446,7 +1530,7 @@ export function matchTemplatesFromText(
 function cleanStepTemplateHint(raw: string): string {
   return normalize(raw)
     .replace(/\s+and\s*$/i, '')
-    .replace(/\b(again|the|a|an|template|mail|use)\b/g, ' ')
+    .replace(/\b(again|the|a|an|template|mail|use|make|set|put|keep|it|only|just|actually)\b/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -1470,6 +1554,26 @@ function resolveStepOrdinal(token: string, stepCount: number): number | null {
 const STEP_TARGET_TOKENS =
   'first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|last|final|rest|others|remaining|mail\\s*\\d+';
 const STEP_SPREAD_RE = /^(?:rest|others|remaining)$/i;
+const STEP_INLINE_TEMPLATE_RE =
+  /\b(?:one|another|next|then|and then|after that|followed by)\s+(.+?)\s+(?:mails?|emails?)\b(?=\s+(?:right\s+now\b|now\b|today\b|tomorrow\b|later\b|at\s+\d|in\s+\d|after\s+\d|\d{1,3}\s*(?:hours?|hrs?|minutes?|mins?|days?|weeks?)\b|daily\b|weekly\b|monthly\b|every\b))/gi;
+
+/**
+ * "one intro mail now then follow up mail daily at 12" — infer step hints from chained
+ * clauses, in order. This only runs when no explicit "for first ... for second ..."
+ * directives were found.
+ */
+function parseInlineStepTemplateHints(text: string, stepCount: number): Array<{ index: number; hint: string }> {
+  if (stepCount < 2) return [];
+  const hints: Array<{ index: number; hint: string }> = [];
+  for (const m of text.matchAll(STEP_INLINE_TEMPLATE_RE)) {
+    const hint = cleanStepTemplateHint(m[1]);
+    if (!hint) continue;
+    const index = hints.length;
+    if (index >= stepCount) break;
+    hints.push({ index, hint });
+  }
+  return hints;
+}
 
 /**
  * "for first mail use introduction, for rest use follow up" — one entry per step. A spread
@@ -1477,14 +1581,18 @@ const STEP_SPREAD_RE = /^(?:rest|others|remaining)$/i;
  */
 function parsePerStepTemplateHints(text: string, stepCount: number): Array<{ index: number; hint: string }> {
   if (stepCount < 1) return [];
-  const re = new RegExp(
-    `\\bfor\\s+(?:the\\s+)?(${STEP_TARGET_TOKENS})\\s+(?:mails?\\s+)?(?:use\\s+)?(.+?)`
-      + `(?=\\s+for\\s+(?:the\\s+)?(?:${STEP_TARGET_TOKENS})\\s|$)`,
+  const forwardRe = new RegExp(
+    `\\b(?:for|in)\\s+(?:the\\s+)?(${STEP_TARGET_TOKENS})\\s+(?:mails?\\s+)?(?:use\\s+)?(.+?)`
+      + `(?=\\s+(?:for|in)\\s+(?:the\\s+)?(?:${STEP_TARGET_TOKENS})\\s|$)`,
+    'gi',
+  );
+  const reverseRe = new RegExp(
+    `(?:^|\\b(?:and|then|also|only)\\b)\\s*([^,.!?;]{1,80}?)\\s+(?:in|for)\\s+(?:the\\s+)?(${STEP_TARGET_TOKENS})\\b`,
     'gi',
   );
   const hints: Array<{ index: number; hint: string }> = [];
   const spread: string[] = [];
-  for (const m of text.matchAll(re)) {
+  for (const m of text.matchAll(forwardRe)) {
     const hint = cleanStepTemplateHint(m[2]);
     if (!hint) continue;
     if (STEP_SPREAD_RE.test(m[1].trim())) {
@@ -1504,7 +1612,16 @@ function parsePerStepTemplateHints(text: string, stepCount: number): Array<{ ind
       claimed.add(i);
     }
   }
-  return hints;
+  for (const m of text.matchAll(reverseRe)) {
+    const index = resolveStepOrdinal(m[2], stepCount);
+    if (index == null || index < 0 || index >= stepCount || claimed.has(index)) continue;
+    const hint = cleanStepTemplateHint(m[1]);
+    if (!hint) continue;
+    hints.push({ index, hint });
+    claimed.add(index);
+  }
+  if (hints.length) return hints;
+  return parseInlineStepTemplateHints(text, stepCount);
 }
 
 function foldTemplateText(s: string): string {
@@ -1530,7 +1647,9 @@ function matchTemplatesForStepHint(
     const cn = compactTemplateText(t.name);
     const cd = compactTemplateText(t.description);
     if (name.includes(q) || desc.includes(q) || cn.includes(cq) || cd.includes(cq)) return true;
-    const tokens = q.split(/\s+/).filter((w) => w.length > 1);
+    const tokens = q
+      .split(/\s+/)
+      .filter((w) => w.length > 1 && !['make', 'set', 'put', 'it', 'only', 'just', 'actually'].includes(w));
     return tokens.length > 0 && tokens.every((w) => name.includes(w) || desc.includes(w) || cn.includes(compactTemplateText(w)));
   });
 
@@ -1584,6 +1703,7 @@ function applyPerStepTemplateHints(
   if (!hints.length) return null;
   if (!spec && scheduledSteps.length) {
     spec = {
+      startAt: draft.schedule?.frequency === 'sequence' ? draft.schedule.startAt : undefined,
       count: scheduledSteps.length,
       steps: scheduledSteps.map((step) => ({
         spec: step.spec,
@@ -1596,7 +1716,6 @@ function applyPerStepTemplateHints(
   if (!spec) return null;
 
   for (const { index, hint } of hints) {
-    if (spec.steps[index]?.templateId) continue;
     const match = matchTemplatesForStepHint(hint, templates, index);
     if (match.kind === 'single') {
       if (!spec.steps[index]) spec.steps[index] = {};
@@ -2930,9 +3049,10 @@ export async function handleChatMessage(
     draft.sequenceSpec = undefined;
   }
 
-  if (inCreateFlow && cadenceIntent == null && looksLikeSequence(text)) {
+  const addMoreApplied = inCreateFlow && cadenceIntent == null && applyAddMoreSequenceIntent(draft, text);
+  if (inCreateFlow && cadenceIntent == null && (addMoreApplied || looksLikeSequence(text))) {
     draft.sequenceRequested = true;
-    seedSequenceFromText(draft, text);
+    if (!addMoreApplied) seedSequenceFromText(draft, text);
     toCollecting(draft);
     if (isForeverSequence(text) && !draft.sequenceSpec?.count) {
       await saveDraft(userId, draft);
@@ -2946,9 +3066,11 @@ export async function handleChatMessage(
 
   // ---- deterministic time parsing, ahead of the model ----
   const customRecurringGap = cadenceIntent === 'clarify' && parseIntervalGapMinutes(text) != null;
+  const normalizedTimeText = text.replace(/\b(?:12\s+)?noon\b/gi, '12 pm');
   const when = draft.sequenceRequested || customRecurringGap
     ? null
-    : parseWhen(text.replace(/\b(?:12\s+)?noon\b/gi, '12 pm'), timezone);
+    : parseWhen(normalizedTimeText, timezone)
+      ?? parseTimeCorrection(normalizedTimeText, draft.schedule, timezone);
   if (when && draft.action === 'create') {
     // "send it now" with nothing collected must NOT send — it just records the intent.
     draft.schedule = when.schedule;
@@ -3302,6 +3424,30 @@ if (process.argv[1]?.endsWith('chat-parser.ts')) {
   assert.equal(singleMerged.schedule?.runAt, '2026-08-26T09:30:00.000Z');
   assert.equal(singleMerged.sequenceRequested, undefined);
 
+  // --- bare clock corrections while a once preview is open ---
+  const editDraft = emptyDraft();
+  editDraft.schedule = { frequency: 'once', runAt: '2023-10-05T13:00:00.000Z' };
+  toCollecting(editDraft);
+  const corrected = mergeInterpretation(editDraft, {}, {
+    allowActionChange: false,
+    deterministicSchedule: parseTimeCorrection(
+      'Actually, make it 1 in afternoon',
+      editDraft.schedule,
+      singleTz,
+      singleNow,
+    )?.schedule,
+  });
+  assert.equal(corrected.schedule?.frequency, 'once');
+  assert.equal(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: singleTz,
+      hour: 'numeric',
+      minute: 'numeric',
+      hour12: true,
+    }).format(new Date(corrected.schedule!.runAt!)),
+    '1:00 PM',
+  );
+
   // --- phase 5 ambiguity guards ---
   assert.equal(isForeverSequence('send forever'), true);
   const foreverDraft = emptyDraft();
@@ -3535,6 +3681,11 @@ if (process.argv[1]?.endsWith('chat-parser.ts')) {
     ['intro', 'follow1', 'intro'],
     'per-step directives override a sequence already materialized from the LLM',
   );
+  assert.equal(
+    rematerializedPerStep?.startAt,
+    validSeq!.startAt,
+    'template edits on a materialized sequence keep the original startAt',
+  );
   const ambTpl = matchTemplatesForStepHint('followup', stepTplMocks, 1);
   assert.equal(ambTpl.kind, 'choices');
   if (ambTpl.kind === 'choices') {
@@ -3559,11 +3710,71 @@ if (process.argv[1]?.endsWith('chat-parser.ts')) {
   assert.equal(parseChainMarkerCount(chainBugText), 3, 'three explicit step markers mean three sends');
   assert.equal(looksLikeSequence(chainBugText), true);
 
+  const inlineTemplateText =
+    'create a sequence for prakhar send one introduction mail now then follow up mail daily at 12 noon';
+  const inlineHints = parsePerStepTemplateHints(inlineTemplateText, 2);
+  assert.deepEqual(
+    inlineHints.map((h) => h.index),
+    [0, 1],
+    'chained inline template hints map to step order',
+  );
+  assert.deepEqual(
+    inlineHints.map((h) => h.hint),
+    ['introduction', 'follow up'],
+    'inline template names are preserved for per-step resolution',
+  );
+  const inlineStepDraft = emptyDraft();
+  inlineStepDraft.sequenceRequested = true;
+  inlineStepDraft.sequenceSpec = { count: 2, steps: [{}, {}] };
+  assert.equal(applyPerStepTemplateHints(inlineStepDraft, inlineTemplateText, stepTplUnique), null);
+  assert.deepEqual(
+    inlineStepDraft.sequenceSpec!.steps.map((s) => s.templateId),
+    ['intro', 'follow1'],
+    'inline chained directives resolve a different template for each send',
+  );
+  const correctionStepDraft = emptyDraft();
+  correctionStepDraft.sequenceRequested = true;
+  correctionStepDraft.sequenceSpec = { count: 2, steps: [{ templateId: 'intro' }, { templateId: 'intro' }] };
+  assert.equal(
+    applyPerStepTemplateHints(
+      correctionStepDraft,
+      'make it introduction in first only in second use followup',
+      stepTplUnique,
+    ),
+    null,
+  );
+  assert.deepEqual(
+    correctionStepDraft.sequenceSpec!.steps.map((s) => s.templateId),
+    ['intro', 'follow1'],
+    'explicit step-template correction overrides an earlier step template assignment',
+  );
+
   const chainSeed = emptyDraft();
   chainSeed.sequenceRequested = true;
   seedSequenceFromText(chainSeed, chainBugText);
   assert.equal(chainSeed.sequenceSpec?.count, 3, 'the marker chain seeds the count');
   assert.equal(chainSeed.sequenceSpec?.steps.length, 3);
+  const afterFirstStep = parseChainedSequenceSteps('add one 2 hours after first one');
+  assert.equal(afterFirstStep?.[0]?.spec?.kind, 'after', '"2 hours after first one" parses as a relative step');
+  if (afterFirstStep?.[0]?.spec?.kind === 'after') assert.equal(afterFirstStep[0].spec.minutes, 120);
+
+  const addMoreDraft = emptyDraft();
+  addMoreDraft.templateId = 'intro';
+  addMoreDraft.schedule = { frequency: 'once', runAt: '2026-08-22T07:30:00.000Z' };
+  assert.equal(
+    applyAddMoreSequenceIntent(addMoreDraft, 'add 2 more mails one 2 hours after first one'),
+    true,
+    '"add N more" is treated as extending an existing draft, not replacing it',
+  );
+  assert.equal(addMoreDraft.schedule, undefined, 'add-more conversion moves once schedule into sequenceSpec');
+  assert.equal(addMoreDraft.sequenceSpec?.startAt, '2026-08-22T07:30:00.000Z');
+  assert.equal(addMoreDraft.sequenceSpec?.count, 3, 'existing one-time send plus 2 more => 3 total');
+  assert.equal(addMoreDraft.sequenceSpec?.steps[0]?.spec?.kind, 'after');
+  assert.equal(addMoreDraft.sequenceSpec?.steps[1]?.spec?.kind, 'after');
+  if (addMoreDraft.sequenceSpec?.steps[1]?.spec?.kind === 'after') {
+    assert.equal(addMoreDraft.sequenceSpec.steps[1].spec.minutes, 120);
+  }
+  assert.notEqual(nextAmbiguity(addMoreDraft)?.kind, 'count', '"add more" should not ask again for total send count');
 
   withFrozenNow('2026-08-21T02:30:00.000Z', () => {
     const chainDraft = emptyDraft();
@@ -3806,7 +4017,7 @@ if (process.argv[1]?.endsWith('chat-parser.ts')) {
   }
 
   // --- correction detection needs real evidence, not a stray "at" or "add" ---
-  for (const t of ['make it 3pm', 'change it to Monday at 10am', 'send it tomorrow', 'change the time']) {
+  for (const t of ['make it 3pm', 'change it to Monday at 10am', 'send it tomorrow', 'change the time', 'Actually, make it 1 in afternoon', '1 pm']) {
     assert.equal(looksLikeScheduleCorrection(t), true, `${t} is a schedule correction`);
   }
   for (const t of ['the one at the top', 'Quotation at Best Rate', 'the template at the bottom']) {

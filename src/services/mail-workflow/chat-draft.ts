@@ -9,6 +9,8 @@ export type RawStep = {
 };
 
 export type SequenceSpec = {
+  /** Fixed base instant when editing an existing once/sequence draft. */
+  startAt?: string;
   anchor?: 'now' | 'after_gap';
   count?: number;
   sameDay?: boolean;

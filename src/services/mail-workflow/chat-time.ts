@@ -24,7 +24,30 @@ function normalize(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9:\s-]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+function parseDayPartClock(text: string): { hour: number; minute: number } | null {
+  const match = text.match(
+    /\b(\d{1,2})(?::(\d{2}))?\s+(?:in\s+(?:the\s+)?)?(morning|afternoon|evening)\b/i,
+  );
+  if (!match) return null;
+
+  let hour = Number.parseInt(match[1], 10);
+  const minute = match[2] ? Number.parseInt(match[2], 10) : 0;
+  const part = match[3].toLowerCase();
+  if (!Number.isFinite(hour) || !Number.isFinite(minute) || hour < 1 || hour > 12 || minute < 0 || minute > 59) {
+    return null;
+  }
+  if (part === 'afternoon' || part === 'evening') {
+    if (hour !== 12) hour += 12;
+  } else if (part === 'morning' && hour === 12) {
+    hour = 0;
+  }
+  return { hour, minute };
+}
+
 export function parseClock(text: string): { hour: number; minute: number } | null {
+  const dayPart = parseDayPartClock(text);
+  if (dayPart) return dayPart;
+
   // Require am/pm or a colon: a bare number is a template name ("Follow-up 1"), not a time.
   const match =
     text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)\b/i)
@@ -238,6 +261,84 @@ export function parseWhen(
   return null;
 }
 
+function looksLikeTimeCorrection(text: string): boolean {
+  const t = normalize(text);
+  return (
+    /\b(make it|change(?:\s+it)?\s+to|set it to|instead|rather|move it to|update it to)\b/.test(t)
+    || /\b\d{1,2}(:\d{2})?\s*(am|pm)\b/.test(t)
+    || /\b\d{1,2}\s+(?:in\s+(?:the\s+)?)?(morning|afternoon|evening)\b/.test(t)
+  );
+}
+
+function onceRunAtForClock(
+  timezone: string,
+  clock: { hour: number; minute: number },
+  civil: { y: number; m: number; d: number },
+  now: Date,
+): string {
+  const candidate = instant(timezone, civil, clock);
+  if (new Date(candidate).getTime() > now.getTime()) return candidate;
+  const today = civilToday(timezone, now);
+  const todayAt = instant(timezone, today, clock);
+  if (new Date(todayAt).getTime() > now.getTime()) return todayAt;
+  return instant(timezone, civilShift(timezone, now, 1), clock);
+}
+
+/**
+ * Apply a bare clock correction ("make it 3pm", "1 in the afternoon") when parseWhen
+ * returns null — common while editing an existing preview.
+ */
+export function parseTimeCorrection(
+  text: string,
+  existing: WorkflowSchedule | null | undefined,
+  timezone: string,
+  now: Date = new Date(),
+): ParsedWhen | null {
+  const preprocessed = text.replace(/\b(?:12\s+)?noon\b/gi, '12 pm');
+  const clock = parseClock(preprocessed);
+  if (!clock || !looksLikeTimeCorrection(preprocessed)) return null;
+
+  if (existing?.frequency === 'daily') {
+    return { schedule: { frequency: 'daily', time: hhmm(clock) }, explicit: true };
+  }
+  if (existing?.frequency === 'weekly' && existing.dayOfWeek != null) {
+    return {
+      schedule: { frequency: 'weekly', time: hhmm(clock), dayOfWeek: existing.dayOfWeek },
+      explicit: true,
+    };
+  }
+  if (existing?.frequency === 'monthly' && existing.dayOfMonth != null) {
+    return {
+      schedule: { frequency: 'monthly', time: hhmm(clock), dayOfMonth: existing.dayOfMonth },
+      explicit: true,
+    };
+  }
+
+  if (existing?.frequency === 'once' && existing.runAt) {
+    const prev = new Date(existing.runAt);
+    const civil = Number.isNaN(prev.getTime())
+      ? civilToday(timezone, now)
+      : {
+          y: Number(civilDateInZone(prev, timezone).slice(0, 4)),
+          m: Number(civilDateInZone(prev, timezone).slice(5, 7)),
+          d: Number(civilDateInZone(prev, timezone).slice(8, 10)),
+        };
+    return {
+      schedule: {
+        frequency: 'once',
+        runAt: onceRunAtForClock(timezone, clock, civil, now),
+      },
+      explicit: true,
+    };
+  }
+
+  const todayAt = instant(timezone, civilShift(timezone, now, 0), clock);
+  const runAt = new Date(todayAt).getTime() > now.getTime()
+    ? todayAt
+    : instant(timezone, civilShift(timezone, now, 1), clock);
+  return { schedule: { frequency: 'once', runAt }, explicit: true };
+}
+
 if (process.argv[1]?.endsWith('chat-time.ts')) {
   const tz = 'Asia/Kolkata';
   // Tue 25 Aug 2026, 10:30 IST
@@ -251,6 +352,9 @@ if (process.argv[1]?.endsWith('chat-time.ts')) {
   assert.deepEqual(parseClock('at 14:30'), { hour: 14, minute: 30 });
   assert.deepEqual(parseClock('at 12am'), { hour: 0, minute: 0 });
   assert.deepEqual(parseClock('at 12pm'), { hour: 12, minute: 0 });
+  assert.deepEqual(parseClock('1 in the afternoon'), { hour: 13, minute: 0 });
+  assert.deepEqual(parseClock('make it 1 in afternoon'), { hour: 13, minute: 0 });
+  assert.deepEqual(parseClock('7 in the evening'), { hour: 19, minute: 0 });
 
   // recurring
   assert.deepEqual(when('every day at 2 PM')!.schedule, { frequency: 'daily', time: '14:00' });
@@ -310,6 +414,31 @@ if (process.argv[1]?.endsWith('chat-time.ts')) {
   // timezone correctness: the same words in a different zone give a different instant
   const ny = parseWhen('send it tomorrow at 9am', 'America/New_York', now)!;
   assert.equal(ny.schedule.runAt, '2026-08-26T13:00:00.000Z');
+
+  // bare clock corrections while editing a preview
+  assert.equal(parseWhen('make it 3pm', tz, now), null, 'parseWhen ignores bare corrections');
+  const pastOnce = { frequency: 'once' as const, runAt: '2023-10-05T13:00:00.000Z' };
+  const fixPast = parseTimeCorrection('Actually, make it 1 in afternoon', pastOnce, tz, now)!;
+  assert.equal(fixPast.schedule.frequency, 'once');
+  assert.equal(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      hour: 'numeric',
+      minute: 'numeric',
+      hour12: true,
+    }).format(new Date(fixPast.schedule.runAt!)),
+    '1:00 PM',
+  );
+  const fixPm = parseTimeCorrection('1 pm', pastOnce, tz, now)!;
+  assert.equal(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      hour: 'numeric',
+      minute: 'numeric',
+      hour12: true,
+    }).format(new Date(fixPm.schedule.runAt!)),
+    '1:00 PM',
+  );
 
   console.log('chat-time self-check passed');
 }

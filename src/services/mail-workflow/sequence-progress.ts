@@ -7,7 +7,9 @@ import { listEmailTemplates } from '../email-templates.service.js';
 import { WorkflowError } from './contract.js';
 import type { StepSpec, WorkflowStatus } from './contract.js';
 import { computeNextRunAt, stepTemplateId } from './recurrence.js';
-import { loadOwnedLeads, modelScheduleToContract } from './workflow.service.js';
+import { loadOwnedLeads, modelScheduleToContract, scheduleLabel } from './workflow.service.js';
+
+export type WorkflowProgressKind = 'sequence' | 'recurring';
 
 export type SequenceStepStatus = 'sent' | 'pending' | 'failed' | 'skipped';
 
@@ -23,8 +25,10 @@ export type SequenceStepProgress = {
 
 export type SequenceProgressItem = {
   workflowId: string;
+  kind: WorkflowProgressKind;
   name: string;
   subjectLabel: string;
+  scheduleLabel: string;
   status: string;
   contact: { id: string; name: string; email: string; company: string };
   timezone: string;
@@ -123,8 +127,10 @@ export async function buildSequenceProgress(
 
   return {
     workflowId: wf.id,
+    kind: 'sequence',
     name: defaultTemplateName,
     subjectLabel: defaultTemplateName,
+    scheduleLabel: scheduleLabel(schedule, wf.timezone),
     status: wf.status,
     contact: {
       id: lead?.id ?? wf.recipientIds[0] ?? '',
@@ -143,18 +149,71 @@ export async function buildSequenceProgress(
   };
 }
 
+export async function buildRecurringProgress(
+  userId: string,
+  workflowId: string,
+): Promise<SequenceProgressItem> {
+  const wf = await MailWorkflowModel.findOne({ userId, id: workflowId }).lean();
+  if (!wf) throw new WorkflowError('WORKFLOW_NOT_FOUND', 'workflow not found');
+
+  const schedule = modelScheduleToContract(wf.schedule);
+  if (schedule.frequency !== 'daily' && schedule.frequency !== 'weekly' && schedule.frequency !== 'monthly') {
+    throw new WorkflowError('CONTRACT_INVALID', 'not a recurring workflow', 400);
+  }
+
+  const [templates, leads] = await Promise.all([
+    listEmailTemplates(userId),
+    wf.recipientIds.length ? loadOwnedLeads(userId, wf.recipientIds).catch(() => []) : Promise.resolve([]),
+  ]);
+
+  const templateName = templates.find((t) => t.id === wf.templateId)?.name ?? wf.templateId;
+  const lead = leads[0];
+  const nextPendingAt =
+    toIso(wf.nextRunAt)
+    ?? toIso(computeNextRunAt(schedule, wf.timezone, new Date(), {
+      afterOccurrence: wf.lastRunAt ?? new Date(0),
+    }));
+
+  return {
+    workflowId: wf.id,
+    kind: 'recurring',
+    name: templateName,
+    subjectLabel: templateName,
+    scheduleLabel: scheduleLabel(schedule, wf.timezone),
+    status: wf.status,
+    contact: {
+      id: lead?.id ?? wf.recipientIds[0] ?? '',
+      name: lead?.contactName ?? 'Unknown contact',
+      email: lead?.contactEmail ?? '',
+      company: lead?.companyName ?? '',
+    },
+    timezone: wf.timezone,
+    totalSteps: 0,
+    sentSteps: wf.runCount ?? 0,
+    remainingSteps: 0,
+    remainingCount: 0,
+    nextPendingAt,
+    startAt: null,
+    steps: [],
+  };
+}
+
 export async function listSequenceProgress(userId: string): Promise<SequenceProgressItem[]> {
   const workflows = await MailWorkflowModel.find({
     userId,
     status: { $in: IN_PROGRESS },
-    'schedule.frequency': 'sequence',
+    'schedule.frequency': { $in: ['sequence', 'daily', 'weekly', 'monthly'] },
   })
     .sort({ updatedAt: -1 })
     .lean();
 
   const items: SequenceProgressItem[] = [];
   for (const wf of workflows) {
-    items.push(await buildSequenceProgress(userId, wf.id));
+    const freq = wf.schedule?.frequency;
+    if (freq === 'sequence') items.push(await buildSequenceProgress(userId, wf.id));
+    else if (freq === 'daily' || freq === 'weekly' || freq === 'monthly') {
+      items.push(await buildRecurringProgress(userId, wf.id));
+    }
   }
   return items;
 }
