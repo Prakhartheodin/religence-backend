@@ -40,8 +40,23 @@ export type SendState =
 export type RecipientSendStatus = 'pending' | 'sending' | 'sent' | 'failed' | 'unknown';
 
 /** `once` is a first-class frequency, not maxRuns=1 in disguise. */
-export type Frequency = 'once' | 'daily' | 'weekly' | 'monthly';
+export type Frequency = 'once' | 'daily' | 'weekly' | 'monthly' | 'sequence';
 export type ExecutionMode = 'recurring' | 'once';
+
+/** How one step in a sequence is timed. */
+export type StepSpec =
+  /** Relative: "after 1 hour", "3 days later". */
+  | { kind: 'after'; minutes: number; from: 'start' | 'previous' }
+  /** Absolute wall clock in the workflow timezone: "at 2pm", "9am on day 3". */
+  | { kind: 'at'; time: string; dayOffset: number };
+
+export type SequenceStep = {
+  spec: StepSpec;
+  /** Materialized ISO-8601 UTC instant. The scheduler reads only this. */
+  at: string;
+  /** Absent = inherit the workflow's templateId. */
+  templateId?: string;
+};
 
 export type WorkflowSchedule = {
   frequency: Frequency;
@@ -53,6 +68,10 @@ export type WorkflowSchedule = {
   dayOfMonth?: number; // monthly 1–31
   endDate?: string; // YYYY-MM-DD
   maxRuns?: number;
+  /** sequence only: the anchor the steps were materialized from. Never moves. */
+  startAt?: string;
+  /** sequence only: ordered, materialized steps. */
+  steps?: SequenceStep[];
 };
 
 export type WorkflowCommandContractV1 = {
@@ -94,7 +113,7 @@ export class WorkflowError extends Error {
 import { randomUUID } from 'node:crypto';
 
 const ACTIONS = new Set(['create', 'update', 'pause', 'resume', 'cancel', 'list']);
-const FREQ = new Set(['once', 'daily', 'weekly', 'monthly']);
+const FREQ = new Set(['once', 'daily', 'weekly', 'monthly', 'sequence']);
 const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 const YMD = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -125,6 +144,56 @@ function parseSchedule(raw: unknown): WorkflowSchedule {
 
   if (frequency === 'once') {
     return { frequency: 'once', runAt: parseIsoInstant(s.runAt, 'schedule.runAt') };
+  }
+
+  if (frequency === 'sequence') {
+    const rawSteps = Array.isArray(s.steps) ? s.steps : [];
+    if (!rawSteps.length) {
+      throw new WorkflowError('SCHEDULE_INVALID', 'a sequence needs at least one step');
+    }
+    const steps: SequenceStep[] = rawSteps.map((entry, i) => {
+      const step = entry as Record<string, unknown>;
+      const at = parseIsoInstant(step.at, `schedule.steps[${i}].at`);
+      const rawSpec = (step.spec ?? {}) as Record<string, unknown>;
+      const kind = String(rawSpec.kind ?? '');
+      let spec: StepSpec;
+      if (kind === 'after') {
+        const minutes = Number(rawSpec.minutes);
+        if (!Number.isInteger(minutes) || minutes < 0) {
+          throw new WorkflowError('SCHEDULE_INVALID', `steps[${i}].minutes must be an integer >= 0`);
+        }
+        const from = rawSpec.from === 'start' ? 'start' : 'previous';
+        spec = { kind: 'after', minutes, from };
+      } else if (kind === 'at') {
+        const time = String(rawSpec.time ?? '');
+        if (!HHMM.test(time)) {
+          throw new WorkflowError('SCHEDULE_INVALID', `steps[${i}].time must be HH:mm`);
+        }
+        const dayOffset = Number(rawSpec.dayOffset ?? 0);
+        if (!Number.isInteger(dayOffset) || dayOffset < 0) {
+          throw new WorkflowError('SCHEDULE_INVALID', `steps[${i}].dayOffset must be >= 0`);
+        }
+        spec = { kind: 'at', time, dayOffset };
+      } else {
+        throw new WorkflowError('SCHEDULE_INVALID', `steps[${i}].spec.kind must be 'after' or 'at'`);
+      }
+      const templateId = step.templateId == null ? undefined : String(step.templateId).trim();
+      return { spec, at, ...(templateId ? { templateId } : {}) };
+    });
+
+    // The stored order IS the send order, so a caller cannot hand us a jumbled list and
+    // rely on us to sort it — that would silently change which step is which.
+    for (let i = 1; i < steps.length; i++) {
+      if (new Date(steps[i].at) <= new Date(steps[i - 1].at)) {
+        throw new WorkflowError('SCHEDULE_INVALID', 'sequence steps must be strictly increasing');
+      }
+    }
+
+    return {
+      frequency: 'sequence',
+      startAt: parseIsoInstant(s.startAt, 'schedule.startAt'),
+      steps,
+    };
   }
 
   const time = String(s.time ?? '');
@@ -289,6 +358,39 @@ if (process.argv[1]?.endsWith('contract.ts')) {
   assert.throws(() => parseContract({ ...base, schedule: { frequency: 'weekly', time: '10:00' } }), /dayOfWeek/);
   assert.throws(() => parseContract({ ...base, schedule: { frequency: 'hourly', time: '10:00' } }));
   assert.throws(() => parseContract({ ...base, schedule: undefined }), /schedule required/);
+
+  const seqStart = '2026-08-21T04:30:00.000Z';
+  const seqSteps = [
+    { spec: { kind: 'after', minutes: 60, from: 'previous' }, at: '2026-08-21T05:30:00.000Z' },
+    { spec: { kind: 'at', time: '14:00', dayOffset: 0 }, at: '2026-08-21T08:30:00.000Z' },
+    { spec: { kind: 'after', minutes: 120, from: 'previous' }, at: '2026-08-21T10:30:00.000Z' },
+  ];
+  const seqContract = parseContract({
+    ...base,
+    schedule: { frequency: 'sequence', startAt: seqStart, steps: seqSteps },
+  });
+  assert.equal(seqContract.schedule?.frequency, 'sequence');
+  assert.equal(seqContract.schedule?.startAt, seqStart);
+  assert.deepEqual(seqContract.schedule?.steps, seqSteps);
+  assert.throws(
+    () => parseContract({ ...base, schedule: { frequency: 'sequence', startAt: seqStart, steps: [] } }),
+    /at least one step/,
+  );
+  assert.throws(
+    () =>
+      parseContract({
+        ...base,
+        schedule: {
+          frequency: 'sequence',
+          startAt: seqStart,
+          steps: [
+            { spec: { kind: 'after', minutes: 60, from: 'previous' }, at: '2026-08-21T10:30:00.000Z' },
+            { spec: { kind: 'at', time: '14:00', dayOffset: 0 }, at: '2026-08-21T08:30:00.000Z' },
+          ],
+        },
+      }),
+    /strictly increasing/,
+  );
   assert.equal(executionModeOf({ frequency: 'daily', time: '10:00' }), 'recurring');
   assert.equal(isOnceSchedule({ frequency: 'once', runAt: new Date().toISOString() }), true);
   console.log('contract self-check passed');

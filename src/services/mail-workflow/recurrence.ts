@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import type { WorkflowSchedule } from './contract.js';
+import type { StepSpec, WorkflowSchedule } from './contract.js';
 
 function zonedParts(date: Date, timeZone: string) {
   const fmt = new Intl.DateTimeFormat('en-US', {
@@ -103,6 +103,26 @@ export function computeNextRunAt(
 ): Date | null {
   const after = opts?.afterOccurrence ?? fromUtc;
 
+  if (schedule.frequency === 'sequence') {
+    const steps = schedule.steps ?? [];
+    // A sequence with no steps is a corrupt row. Returning null here would set
+    // status:'completed' and report success for a workflow that sent nothing.
+    if (!steps.length) throw new Error('sequence schedule has no steps');
+
+    // Scan for the EARLIEST instant after the cursor rather than the first one in array
+    // order. Same cost, and it cannot pick the wrong step if a stored list is ever out of
+    // order — which would also mis-map per-step templates.
+    let best: Date | null = null;
+    for (const step of steps) {
+      const at = new Date(step.at);
+      if (Number.isNaN(at.getTime())) {
+        throw new Error(`invalid sequence step instant: ${String(step.at)}`);
+      }
+      if (at > after && (best === null || at < best)) best = at;
+    }
+    return best;
+  }
+
   if (schedule.frequency === 'once') {
     const at = scheduleRunAt(schedule);
     if (!at) return null;
@@ -133,6 +153,97 @@ export function computeNextRunAt(
     ({ year: y, month: mo, day: d } = addCivilDays(y, mo, d, 1));
   }
   return null;
+}
+
+/** A roll should need one day; only a DST shift can need two. Beyond that is a bug. */
+const MAX_ROLL_DAYS = 3;
+
+/**
+ * Turn relative/absolute step specs into absolute instants, once, at preview time.
+ *
+ * Frozen on purpose: the card the user approves lists real dates, and confirming must not
+ * move them. It also keeps the scheduler trivial — at runtime it reads a list and never
+ * re-derives an offset.
+ */
+export function materializeSequence(
+  startAt: Date,
+  timezone: string,
+  specs: StepSpec[],
+): Date[] {
+  if (Number.isNaN(startAt.getTime())) throw new Error('materializeSequence: invalid startAt');
+  if (!specs.length) throw new Error('materializeSequence: no steps');
+
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const out: Date[] = [];
+  let prev = startAt;
+
+  for (let i = 0; i < specs.length; i++) {
+    const spec = specs[i];
+    let t: Date;
+
+    if (spec.kind === 'after') {
+      if (!Number.isInteger(spec.minutes) || spec.minutes < 0) {
+        throw new Error(`step ${i + 1}: minutes must be an integer >= 0`);
+      }
+      // Only the first step may be zero-delay ("send now, then ..."). A later zero would
+      // collide with its predecessor.
+      if (spec.minutes === 0 && i > 0) throw new Error(`step ${i + 1}: minutes must be >= 1`);
+      const base = spec.from === 'start' ? startAt : prev;
+      t = new Date(base.getTime() + spec.minutes * 60_000);
+    } else {
+      const hour = Number(spec.time.slice(0, 2));
+      const minute = Number(spec.time.slice(3, 5));
+      if (!/^\d{2}:\d{2}$/.test(spec.time) || hour > 23 || minute > 59) {
+        throw new Error(`step ${i + 1}: invalid clock ${spec.time}`);
+      }
+      if (!Number.isInteger(spec.dayOffset) || spec.dayOffset < 0) {
+        throw new Error(`step ${i + 1}: dayOffset must be >= 0`);
+      }
+
+      // Begin at the LATER of (startAt + dayOffset) and the previous step's own civil day.
+      // Rolling one day at a time from dayOffset would cost up to 365 utcFromZoned calls,
+      // and each of those is a binary search over ~40 Intl.formatToParts — a visible stall
+      // inside a preview request.
+      const startCivil = civilDateInZone(startAt, timezone);
+      const shifted = addCivilDays(
+        Number(startCivil.slice(0, 4)),
+        Number(startCivil.slice(5, 7)),
+        Number(startCivil.slice(8, 10)),
+        spec.dayOffset,
+      );
+      const shiftedIso = `${shifted.year}-${pad(shifted.month)}-${pad(shifted.day)}`;
+      const prevCivil = civilDateInZone(prev, timezone);
+      let cur =
+        shiftedIso >= prevCivil
+          ? shifted
+          : {
+              year: Number(prevCivil.slice(0, 4)),
+              month: Number(prevCivil.slice(5, 7)),
+              day: Number(prevCivil.slice(8, 10)),
+            };
+
+      t = utcFromZoned(timezone, cur.year, cur.month, cur.day, hour, minute);
+      // "2pm" said after a 3pm send obviously means tomorrow. Recomputing from civil parts
+      // on each roll is what keeps this DST-correct.
+      let rolls = 0;
+      while (t <= prev) {
+        if (++rolls > MAX_ROLL_DAYS) {
+          throw new Error(`step ${i + 1}: ${spec.time} cannot be placed after the previous send`);
+        }
+        cur = addCivilDays(cur.year, cur.month, cur.day, 1);
+        t = utcFromZoned(timezone, cur.year, cur.month, cur.day, hour, minute);
+      }
+    }
+
+    // Step 1 may land exactly on startAt (zero-delay); later steps must be strictly after.
+    if (i === 0 ? t < startAt : t <= prev) {
+      throw new Error(`step ${i + 1}: resolves before the step it follows`);
+    }
+    out.push(t);
+    prev = t;
+  }
+
+  return out;
 }
 
 /** Default: an occurrence more than this far in the past is stale and will not be sent. */
@@ -334,5 +445,201 @@ if (process.argv[1]?.endsWith('recurrence.ts')) {
   }
 
   assert.equal(planCatchUp(dailyTen, tz, null, nowT).action, 'complete');
+
+  const seqFrom = (startIso: string, tzName: string, specs: StepSpec[]): WorkflowSchedule => {
+    const at = materializeSequence(new Date(startIso), tzName, specs);
+    return {
+      frequency: 'sequence',
+      startAt: startIso,
+      steps: at.map((d, i) => ({ spec: specs[i], at: d.toISOString() })),
+    };
+  };
+
+  // 1. §2 example
+  const exStart = '2026-08-21T04:30:00.000Z';
+  const exSpecs: StepSpec[] = [
+    { kind: 'after', minutes: 60, from: 'previous' },
+    { kind: 'at', time: '14:00', dayOffset: 0 },
+    { kind: 'after', minutes: 120, from: 'previous' },
+  ];
+  const ex = seqFrom(exStart, 'Asia/Kolkata', exSpecs);
+  assert.equal(ex.steps![0].at, '2026-08-21T05:30:00.000Z', '11:00 IST');
+  assert.equal(ex.steps![1].at, '2026-08-21T08:30:00.000Z', '14:00 IST');
+  assert.equal(ex.steps![2].at, '2026-08-21T10:30:00.000Z', '16:00 IST');
+
+  // 2. Roll-forward
+  const rollStart = '2026-08-21T03:00:00.000Z';
+  const rollSpecs: StepSpec[] = [
+    { kind: 'at', time: '10:00', dayOffset: 0 },
+    { kind: 'at', time: '09:00', dayOffset: 0 },
+  ];
+  const roll = seqFrom(rollStart, 'Asia/Kolkata', rollSpecs);
+  assert.equal(civilDateInZone(new Date(roll.steps![0].at), 'Asia/Kolkata'), '2026-08-21');
+  assert.equal(civilDateInZone(new Date(roll.steps![1].at), 'Asia/Kolkata'), '2026-08-22');
+
+  // 3. Same day, several steps
+  const sameDaySpecs: StepSpec[] = [
+    { kind: 'at', time: '14:00', dayOffset: 0 },
+    { kind: 'at', time: '17:00', dayOffset: 0 },
+    { kind: 'at', time: '20:00', dayOffset: 0 },
+  ];
+  const sameDay = seqFrom(exStart, 'Asia/Kolkata', sameDaySpecs);
+  assert.equal(civilDateInZone(new Date(sameDay.steps![0].at), 'Asia/Kolkata'), '2026-08-21');
+  assert.equal(civilDateInZone(new Date(sameDay.steps![1].at), 'Asia/Kolkata'), '2026-08-21');
+  assert.equal(civilDateInZone(new Date(sameDay.steps![2].at), 'Asia/Kolkata'), '2026-08-21');
+  assert.ok(new Date(sameDay.steps![0].at) < new Date(sameDay.steps![1].at));
+  assert.ok(new Date(sameDay.steps![1].at) < new Date(sameDay.steps![2].at));
+
+  // 4. Walk and terminate
+  const walk = seqFrom(exStart, 'Asia/Kolkata', exSpecs);
+  let cursor = new Date('2026-08-21T00:00:00.000Z');
+  assert.equal(
+    computeNextRunAt(walk, 'Asia/Kolkata', cursor, { afterOccurrence: cursor })!.toISOString(),
+    ex.steps![0].at,
+  );
+  cursor = new Date(ex.steps![0].at);
+  assert.equal(
+    computeNextRunAt(walk, 'Asia/Kolkata', cursor, { afterOccurrence: cursor })!.toISOString(),
+    ex.steps![1].at,
+  );
+  cursor = new Date(ex.steps![1].at);
+  assert.equal(
+    computeNextRunAt(walk, 'Asia/Kolkata', cursor, { afterOccurrence: cursor })!.toISOString(),
+    ex.steps![2].at,
+  );
+  cursor = new Date(ex.steps![2].at);
+  assert.equal(computeNextRunAt(walk, 'Asia/Kolkata', cursor, { afterOccurrence: cursor }), null);
+
+  // 5. Unsorted steps
+  const sorted = seqFrom(exStart, 'Asia/Kolkata', exSpecs);
+  const shuffled: WorkflowSchedule = {
+    frequency: 'sequence',
+    startAt: exStart,
+    steps: [sorted.steps![2], sorted.steps![0], sorted.steps![1]],
+  };
+  assert.equal(
+    computeNextRunAt(shuffled, 'Asia/Kolkata', new Date('2026-08-21T00:00:00.000Z'))!.toISOString(),
+    sorted.steps![0].at,
+  );
+
+  // 6. Malformed instant
+  assert.throws(
+    () =>
+      computeNextRunAt(
+        {
+          frequency: 'sequence',
+          steps: [{ spec: { kind: 'after', minutes: 60, from: 'previous' }, at: 'not-a-date' }],
+        },
+        'Asia/Kolkata',
+        new Date(),
+      ),
+    /invalid sequence step instant/,
+  );
+
+  // 7. Empty steps
+  assert.throws(
+    () => computeNextRunAt({ frequency: 'sequence', steps: [] }, 'Asia/Kolkata', new Date()),
+    /no steps/,
+  );
+
+  // 8. endDate ignored
+  const withEndDate: WorkflowSchedule = { ...ex, endDate: '2020-01-01' };
+  assert.equal(
+    computeNextRunAt(withEndDate, 'Asia/Kolkata', new Date('2026-08-21T00:00:00.000Z'))!.toISOString(),
+    ex.steps![0].at,
+  );
+
+  // 9. DST across a sequence
+  const dstStart = '2026-03-07T15:00:00.000Z';
+  const dstSpecs: StepSpec[] = [
+    { kind: 'at', time: '10:00', dayOffset: 0 },
+    { kind: 'at', time: '10:00', dayOffset: 1 },
+  ];
+  const dstSeq = seqFrom(dstStart, 'America/New_York', dstSpecs);
+  const nyFmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    hourCycle: 'h23',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+  for (const step of dstSeq.steps!) {
+    const parts: Record<string, string> = {};
+    for (const p of nyFmt.formatToParts(new Date(step.at))) {
+      if (p.type !== 'literal') parts[p.type] = p.value;
+    }
+    assert.equal(Number(parts.hour), 10);
+    assert.equal(Number(parts.minute), 0);
+  }
+
+  // 10. Fall-back determinism
+  const fbSpec: StepSpec[] = [{ kind: 'at', time: '01:30', dayOffset: 0 }];
+  const fbStart = '2026-11-01T04:00:00.000Z';
+  const fb1 = materializeSequence(new Date(fbStart), 'America/New_York', fbSpec);
+  const fb2 = materializeSequence(new Date(fbStart), 'America/New_York', fbSpec);
+  assert.equal(fb1[0].toISOString(), fb2[0].toISOString());
+
+  // 11. Timezone independence
+  const tzSeq = seqFrom(exStart, 'Asia/Kolkata', exSpecs);
+  assert.equal(
+    computeNextRunAt(tzSeq, 'UTC', new Date('2026-08-21T00:00:00.000Z'))!.toISOString(),
+    computeNextRunAt(tzSeq, 'Asia/Kolkata', new Date('2026-08-21T00:00:00.000Z'))!.toISOString(),
+  );
+
+  // 12. Leap day
+  const leapStart = '2028-02-28T04:30:00.000Z';
+  const leapSpecs: StepSpec[] = [{ kind: 'at', time: '09:00', dayOffset: 1 }];
+  const leap = seqFrom(leapStart, 'Asia/Kolkata', leapSpecs);
+  assert.equal(civilDateInZone(new Date(leap.steps![0].at), 'Asia/Kolkata'), '2028-02-29');
+
+  // 13. Zero-delay
+  const zeroOk = materializeSequence(new Date(exStart), 'Asia/Kolkata', [
+    { kind: 'after', minutes: 0, from: 'previous' },
+  ]);
+  assert.equal(zeroOk[0].toISOString(), exStart);
+  assert.throws(
+    () =>
+      materializeSequence(new Date(exStart), 'Asia/Kolkata', [
+        { kind: 'after', minutes: 60, from: 'previous' },
+        { kind: 'after', minutes: 0, from: 'previous' },
+      ]),
+    /minutes must be >= 1/,
+  );
+
+  // 14. Duplicate instants
+  assert.throws(
+    () =>
+      materializeSequence(new Date(exStart), 'Asia/Kolkata', [
+        { kind: 'after', minutes: 60, from: 'start' },
+        { kind: 'after', minutes: 60, from: 'start' },
+      ]),
+    /resolves before the step it follows/,
+  );
+
+  // 15. No burst on a sequence
+  const burstStart = '2026-08-21T04:30:00.000Z';
+  const burstSpecs: StepSpec[] = [
+    { kind: 'after', minutes: 0, from: 'previous' },
+    { kind: 'after', minutes: 30, from: 'previous' },
+    { kind: 'after', minutes: 30, from: 'previous' },
+  ];
+  const burstSeq = seqFrom(burstStart, 'Asia/Kolkata', burstSpecs);
+  const burstNow = new Date(burstSeq.steps![2].at);
+  burstNow.setMinutes(burstNow.getMinutes() + 5);
+  const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
+  let burstBacklog: Date | null = new Date(burstSeq.steps![0].at);
+  let burstSends = 0;
+  for (let tick = 0; tick < 6 && burstBacklog; tick++) {
+    const plan = planCatchUp(burstSeq, 'Asia/Kolkata', burstBacklog, burstNow, THREE_HOURS_MS);
+    if (plan.action === 'wait' || plan.action === 'complete') break;
+    const occurrence = plan.action === 'run' ? plan.occurrence : plan.runNow;
+    if (!occurrence) {
+      burstBacklog = plan.action === 'skip' ? plan.nextRunAt : null;
+      continue;
+    }
+    burstSends++;
+    burstBacklog = computeNextRunAt(burstSeq, 'Asia/Kolkata', burstNow, { afterOccurrence: occurrence });
+  }
+  assert.equal(burstSends, 1, 'a sequence backlog must still produce exactly ONE send');
+
   console.log('recurrence self-check passed');
 }

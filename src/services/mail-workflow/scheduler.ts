@@ -139,6 +139,8 @@ export function planForWorkflow(wf: MailWorkflowDocument, now: Date): CatchUpPla
 /** True when the workflow has hit its own stop condition regardless of the clock. */
 export function exhaustedByLimits(wf: MailWorkflowDocument): boolean {
   const schedule = modelScheduleToContract(wf.schedule);
+  // A sequence ends by running out of steps, never by a run count.
+  if (schedule.frequency === 'sequence') return false;
   if (schedule.maxRuns != null && wf.runCount >= schedule.maxRuns) return true;
   return false;
 }
@@ -295,6 +297,21 @@ if (process.argv[1]?.endsWith('scheduler.ts')) {
     true,
   );
   assert.equal(exhaustedByLimits(base), false);
+
+  assert.equal(
+    exhaustedByLimits({
+      ...base,
+      runCount: 5,
+      schedule: {
+        frequency: 'sequence',
+        startAt: new Date(),
+        steps: [{ spec: { kind: 'after', minutes: 60, from: 'previous' }, at: new Date() }],
+        maxRuns: 1,
+      },
+    } as unknown as MailWorkflowDocument),
+    false,
+    'sequence ignores maxRuns',
+  );
 
   // once-schedule shape flows through the planner
   const onceWf = {

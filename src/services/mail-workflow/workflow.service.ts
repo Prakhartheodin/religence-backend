@@ -66,6 +66,11 @@ export function scheduleLabel(s: WorkflowSchedule, tz: string): string {
   if (s.frequency === 'once') {
     return s.runAt ? singleRunLabel(s.runAt, tz) : 'Send once';
   }
+  if (s.frequency === 'sequence') {
+    const n = s.steps?.length ?? 0;
+    // ponytail: a count, not a step table. The card renders the real list in phase 2.
+    return n === 1 ? '1 send' : `${n} sends`;
+  }
   const at = formatTime12(s.time ?? '00:00');
   if (s.frequency === 'daily') return `Every day at ${at}`;
   if (s.frequency === 'weekly') {
@@ -231,6 +236,13 @@ export function contractScheduleToModel(s: WorkflowSchedule): MailWorkflowSchedu
   if (s.frequency === 'once') {
     return { frequency: 'once', runAt: s.runAt ? new Date(s.runAt) : null };
   }
+  if (s.frequency === 'sequence') {
+    return {
+      frequency: 'sequence',
+      startAt: s.startAt ? new Date(s.startAt) : null,
+      steps: (s.steps ?? []).map((step) => ({ ...step })),
+    };
+  }
   return {
     frequency: s.frequency,
     timeOfDay: s.time,
@@ -244,6 +256,17 @@ export function contractScheduleToModel(s: WorkflowSchedule): MailWorkflowSchedu
 export function modelScheduleToContract(s: MailWorkflowSchedule): WorkflowSchedule {
   if (s.frequency === 'once') {
     return { frequency: 'once', runAt: s.runAt ? new Date(s.runAt).toISOString() : undefined };
+  }
+  if (s.frequency === 'sequence') {
+    return {
+      frequency: 'sequence',
+      startAt: s.startAt ? new Date(s.startAt).toISOString() : undefined,
+      steps: (s.steps ?? []).map((step) => ({
+        spec: step.spec,
+        at: new Date(step.at).toISOString(),
+        ...(step.templateId ? { templateId: step.templateId } : {}),
+      })),
+    };
   }
   // Legacy rows stored a one-time send as daily + endDate + maxRuns:1. Read them as `once`.
   if (s.maxRuns === 1 && s.endDate && s.frequency === 'daily' && s.timeOfDay) {
@@ -858,6 +881,20 @@ if (process.argv[1]?.endsWith('workflow.service.ts')) {
   );
   assert.equal(endLabel({ frequency: 'once', runAt: '2026-12-31T10:00:00.000Z' }), 'Single send');
   assert.match(scheduleLabel({ frequency: 'once', runAt: '2026-12-31T10:00:00.000Z' }, 'UTC'), /Send once/);
+
+  const seqLabel = scheduleLabel(
+    {
+      frequency: 'sequence',
+      steps: [
+        { spec: { kind: 'after', minutes: 60, from: 'previous' }, at: '2026-08-21T05:30:00.000Z' },
+        { spec: { kind: 'at', time: '14:00', dayOffset: 0 }, at: '2026-08-21T08:30:00.000Z' },
+        { spec: { kind: 'after', minutes: 120, from: 'previous' }, at: '2026-08-21T10:30:00.000Z' },
+      ],
+    },
+    'Asia/Kolkata',
+  );
+  assert.equal(seqLabel, '3 sends');
+  assert.doesNotMatch(seqLabel, /Every month/);
 
   // legacy daily+maxRuns:1 rows still read back without crashing
   assert.equal(

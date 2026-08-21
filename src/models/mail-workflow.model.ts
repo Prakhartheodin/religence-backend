@@ -1,5 +1,5 @@
 import mongoose from 'mongoose';
-import type { ExecutionMode, Frequency, WorkflowStatus } from '../services/mail-workflow/contract.js';
+import type { ExecutionMode, Frequency, SequenceStep, WorkflowStatus } from '../services/mail-workflow/contract.js';
 
 export type MailWorkflowSchedule = {
   frequency: Frequency;
@@ -11,6 +11,8 @@ export type MailWorkflowSchedule = {
   dayOfMonth?: number;
   endDate?: string;
   maxRuns?: number;
+  startAt?: Date | null;
+  steps?: SequenceStep[];
 };
 
 export type MailWorkflowDocument = {
@@ -38,15 +40,33 @@ export type MailWorkflowDocument = {
   updatedAt: Date;
 };
 
+const sequenceStepSchema = new mongoose.Schema(
+  {
+    spec: { type: mongoose.Schema.Types.Mixed, required: true },
+    at: { type: Date, required: true },
+    templateId: { type: String },
+  },
+  { _id: false }
+);
+
 const scheduleSchema = new mongoose.Schema(
   {
-    frequency: { type: String, required: true, enum: ['once', 'daily', 'weekly', 'monthly'] },
+    frequency: {
+      type: String,
+      required: true,
+      // 'sequence' must stay in this enum FOREVER, even if sequences are disabled. Once a
+      // document holds it, removing the value makes that document unsaveable — it can no
+      // longer be paused or cancelled, only deleted.
+      enum: ['once', 'daily', 'weekly', 'monthly', 'sequence'],
+    },
     timeOfDay: { type: String },
     runAt: { type: Date, default: null },
     dayOfWeek: { type: Number },
     dayOfMonth: { type: Number },
     endDate: { type: String },
     maxRuns: { type: Number },
+    startAt: { type: Date, default: null },
+    steps: { type: [sequenceStepSchema], default: undefined },
   },
   { _id: false }
 );
