@@ -31,6 +31,7 @@ import {
   refreshDraftSteps,
   toAwaitingCreateConfirmation,
   toAwaitingManagementConfirmation,
+  toAwaitingUpdateConfirmation,
   toCollecting,
   toEditing,
   type ConversationDraft,
@@ -86,6 +87,7 @@ import {
   pauseWorkflow,
   resumeWorkflow,
   scheduleLabel,
+  updateWorkflow,
   workflowTimezone,
   type MailWorkflow,
   type PreviewSummary,
@@ -457,6 +459,34 @@ const SEQ_CHAIN_RE = /\b(?:then|after that|followed by|and then)\b/;
 const SEQ_NOUN_RE = /\b(?:sequence|drip|campaign|follow[- ]?ups?)\b/;
 const SEQ_ORDINAL_RE = /\b(?:first|second|third|fourth|1st|2nd|3rd|4th)\b/g;
 const CLOCK_TOKEN_RE = /\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\b\d{1,2}:\d{2}\b/g;
+const RECURRING_MODE_QUESTION =
+  'Do you want this to run continuously until you pause/stop it, or for a fixed number of sends?';
+
+/**
+ * A step marker is "one"/"another"/"next" immediately followed by a when-phrase, which is how
+ * people spell a sequence out without ever naming a number: "one now, one 2 hours later, one
+ * at 5". The when-phrase is what keeps ordinary prose ("one of our leads") out.
+ */
+const SEQ_STEP_MARKER_RE =
+  /\b(?:one|another|next)\s+(?:mails?|emails?)?\s*(?=right\s+now\b|now\b|today\b|tomorrow\b|later\b|at\s+\d|in\s+\d|after\s+\d|\d{1,3}\s*(?:hours?|hrs?|minutes?|mins?|days?|weeks?)\b)/g;
+/** "no one now", "any one later" — a quantifier in front means it was never a step marker. */
+const SEQ_MARKER_QUANTIFIER_RE = /\b(?:no|any|some|each|every|which|that|this|only|just)\s+$/;
+
+/**
+ * The number of sends implied by repeated step markers, or null when the sentence does not
+ * spell a chain out. Two markers is the floor: a lone "one now" is a single send.
+ */
+function parseChainMarkerCount(text: string): number | null {
+  const t = normalize(text);
+  let markers = 0;
+  for (const m of t.matchAll(SEQ_STEP_MARKER_RE)) {
+    const idx = m.index ?? 0;
+    if (SEQ_MARKER_QUANTIFIER_RE.test(t.slice(Math.max(0, idx - 8), idx))) continue;
+    markers++;
+  }
+  if (markers < 2 || markers > MAX_SEQUENCE_STEPS) return null;
+  return markers;
+}
 
 /**
  * True when the message describes MORE THAN ONE send. Matches on structure rather than a
@@ -468,6 +498,7 @@ export function looksLikeSequence(text: string): boolean {
   if (SEQ_INTERVAL_RE.test(t) || SEQ_COUNT_RE.test(t) || SEQ_CHAIN_RE.test(t) || SEQ_NOUN_RE.test(t)) {
     return true;
   }
+  if (parseChainMarkerCount(t) != null) return true;
   const ordinals = t.match(SEQ_ORDINAL_RE) ?? [];
   if (ordinals.length >= 2) return true;
   const clocks = t.match(CLOCK_TOKEN_RE) ?? [];
@@ -490,6 +521,19 @@ function parseSequenceCount(text: string): number | null {
     if (t === word) return n;
   }
   return null;
+}
+
+function recurringCadenceIntent(text: string): 'recurring' | 'clarify' | null {
+  const t = normalize(text);
+  const hasCadence =
+    /\b(?:daily|weekly|every\s+(?:(?:other|second|third|\d{1,3})\s+)?(?:day|week)s?)\b/.test(t);
+  if (!hasCadence || parseSequenceCount(t) != null) return null;
+
+  const unsupportedGap =
+    /\bevery\s+(?:other|second|third|(?:[2-9]|\d{2,3}))\s+(?:day|week)s?\b/.test(t);
+  const mixesFirstSendWithCadence =
+    SEQ_CHAIN_RE.test(t) || (/\bnow\b/.test(t) && /\b(?:daily|weekly|every)\b/.test(t));
+  return unsupportedGap || mixesFirstSendWithCadence ? 'clarify' : 'recurring';
 }
 
 function parseIntervalGapMinutes(text: string): number | null {
@@ -693,6 +737,39 @@ export function nextAmbiguity(draft: ConversationDraft): Ambiguity | null {
     }
   }
 
+  if (spec.count != null && spec.count > 1 && !(spec.gapMinutes != null && spec.count != null && spec.anchor)) {
+    const missingSteps = missingStepNumbers(spec.steps, spec.count);
+    if (missingSteps.length) {
+      return {
+        kind: 'stepCountMismatch',
+        parsed: spec.count - missingSteps.length,
+        expected: spec.count,
+        missingSteps,
+      };
+    }
+    if (spec.steps.length !== spec.count) {
+      const missing = missingStepNumbers(
+        spec.steps.length < spec.count
+          ? [...spec.steps, ...Array(spec.count - spec.steps.length).fill({})]
+          : spec.steps.slice(0, spec.count),
+        spec.count,
+      );
+      if (missing.length) {
+        return {
+          kind: 'stepCountMismatch',
+          parsed: spec.count - missing.length,
+          expected: spec.count,
+          missingSteps: missing,
+        };
+      }
+    }
+  }
+
+  const sameDayIdx = sameDayConflictStep(spec, timezone);
+  if (sameDayIdx != null) {
+    return { kind: 'sameDayConflict', stepIndex: sameDayIdx };
+  }
+
   return null;
 }
 
@@ -709,6 +786,7 @@ function tryMaterializeSequenceDraft(draft: ConversationDraft, timezone: string)
       startAt = new Date(Date.now() + spec.gapMinutes * 60_000);
     }
   } else if (spec.steps.length) {
+    if (spec.count != null && spec.steps.length !== spec.count) return null;
     for (const step of spec.steps) {
       if (!step.spec) return null;
       specs.push(step.spec);
@@ -785,13 +863,240 @@ function matchStepTimeCandidate(text: string, candidates: string[]): string | nu
   return null;
 }
 
+const SEQ_HOUR_WORDS: Record<string, number> = {
+  one: 1, two: 2, three: 3, four: 4, five: 5,
+};
+
+function bareHourCandidates(hour: number): string[] {
+  if (hour < 1 || hour > 12) {
+    if (hour > 23) return [];
+    return [`${String(hour).padStart(2, '0')}:00`];
+  }
+  const am = hour === 12 ? 0 : hour;
+  const pm = hour === 12 ? 12 : hour + 12;
+  return [
+    `${String(am).padStart(2, '0')}:00`,
+    `${String(pm).padStart(2, '0')}:00`,
+  ];
+}
+
+function sequenceStepsAreEmpty(steps: RawStep[]): boolean {
+  return !steps.length || steps.every((s) => !s.spec && !s.candidates?.length);
+}
+
+function stepIsUsable(step: RawStep | undefined): boolean {
+  return Boolean(step?.spec || step?.candidates?.length);
+}
+
+function sequenceStepsNeedFallback(steps: RawStep[]): boolean {
+  return !steps.length || steps.some((s) => !stepIsUsable(s));
+}
+
+function missingStepNumbers(steps: RawStep[], expected: number): number[] {
+  const missing: number[] = [];
+  for (let i = 0; i < expected; i++) {
+    if (!stepIsUsable(steps[i])) missing.push(i + 1);
+  }
+  return missing;
+}
+
+function sameDayConflictStep(spec: SequenceSpec, timezone: string): number | null {
+  if (!spec.sameDay || spec.gapMinutes != null || !spec.count) return null;
+  if (spec.steps.length !== spec.count) return null;
+  const specs: StepSpec[] = [];
+  for (const step of spec.steps) {
+    if (!step.spec) return null;
+    specs.push(step.spec);
+  }
+  if (specs.length < 2) return null;
+  let instants: Date[];
+  try {
+    instants = materializeSequence(new Date(), timezone, specs);
+  } catch {
+    return null;
+  }
+  const day0 = civilDateInZone(new Date(), timezone);
+  for (let i = 0; i < instants.length; i++) {
+    if (civilDateInZone(instants[i], timezone) !== day0) return i;
+  }
+  return null;
+}
+
+function sequenceAmbiguityQuestion(amb: Ambiguity): string {
+  if (amb.kind === 'count') {
+    return 'How many sends do you want in this sequence?';
+  }
+  if (amb.kind === 'anchor') {
+    return 'Starting today, or after the first gap?';
+  }
+  if (amb.kind === 'stepTime') {
+    return `Which time did you mean — ${amb.candidates.map(formatClockLabel).join(' or ')}?`;
+  }
+  if (amb.kind === 'stepCountMismatch') {
+    const ord = (n: number) => (n === 1 ? '1st' : n === 2 ? '2nd' : n === 3 ? '3rd' : `${n}th`);
+    const missing = amb.missingSteps.map(ord).join(', ');
+    return `I have ${amb.parsed} of ${amb.expected} step times. When should the ${missing} step go out?`;
+  }
+  if (amb.kind === 'sameDayConflict') {
+    return `Step ${amb.stepIndex + 1} would land after midnight if everything stays today. Is tomorrow OK for that step, or give me a same-day time?`;
+  }
+  const names = amb.choices.map((c) => c.label).join(', ');
+  return `I found multiple templates for ${amb.hint} on step ${amb.stepIndex + 1}: ${names}. Which one should I use?`;
+}
+
+type ChainedHit = { index: number; len: number; step: RawStep };
+
+// ponytail: narrow chained-step fallback — "now", "N hour(s) later", "at H(:MM)?".
+// Upgrade path: LLM extraction when phrasing exceeds these patterns.
+function parseChainedSequenceSteps(text: string): RawStep[] | null {
+  const t = normalize(text);
+  const hits: ChainedHit[] = [];
+
+  for (const m of t.matchAll(/\bnow\b/g)) {
+    const idx = m.index ?? 0;
+    const before = t.slice(Math.max(0, idx - 4), idx);
+    if (/\bnot\s$/.test(before)) continue;
+    hits.push({
+      index: idx,
+      len: 3,
+      step: { spec: { kind: 'after', minutes: 0, from: 'start' } },
+    });
+  }
+
+  for (const m of t.matchAll(/\b(\d+|one|two|three|four|five)\s+hours?\s+later\b/g)) {
+    const raw = m[1];
+    const n = /\d/.test(raw) ? Number.parseInt(raw, 10) : SEQ_HOUR_WORDS[raw];
+    if (!n || n < 1 || n > 168) continue;
+    hits.push({
+      index: m.index ?? 0,
+      len: m[0].length,
+      step: { spec: { kind: 'after', minutes: n * 60, from: 'previous' } },
+    });
+  }
+
+  const atRe = /\b(?:next\s+)?at\s+(\d{1,2})(?:\s+(\d{2}))?(?:\s*(am|pm))?\b/g;
+  for (const m of t.matchAll(atRe)) {
+    let hour = Number.parseInt(m[1], 10);
+    const minute = m[2] ? Number.parseInt(m[2], 10) : 0;
+    const meridiem = m[3];
+    if (!Number.isFinite(hour) || !Number.isFinite(minute) || minute > 59) continue;
+
+    if (meridiem) {
+      if (hour < 1 || hour > 12) continue;
+      if (meridiem === 'pm' && hour < 12) hour += 12;
+      if (meridiem === 'am' && hour === 12) hour = 0;
+      hits.push({
+        index: m.index ?? 0,
+        len: m[0].length,
+        step: {
+          spec: {
+            kind: 'at',
+            time: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`,
+            dayOffset: 0,
+          },
+        },
+      });
+    } else if (m[2]) {
+      if (hour > 23) continue;
+      hits.push({
+        index: m.index ?? 0,
+        len: m[0].length,
+        step: {
+          spec: {
+            kind: 'at',
+            time: `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`,
+            dayOffset: 0,
+          },
+        },
+      });
+    } else {
+      const candidates = bareHourCandidates(hour);
+      if (!candidates.length) continue;
+      hits.push({
+        index: m.index ?? 0,
+        len: m[0].length,
+        step: candidates.length === 1
+          ? { spec: { kind: 'at', time: candidates[0], dayOffset: 0 } }
+          : { candidates },
+      });
+    }
+  }
+
+  if (!hits.length) return null;
+
+  hits.sort((a, b) => a.index - b.index || b.len - a.len);
+  const picked: ChainedHit[] = [];
+  let cursor = 0;
+  for (const h of hits) {
+    if (h.index < cursor) continue;
+    picked.push(h);
+    cursor = h.index + h.len;
+  }
+
+  const steps = picked.slice(0, MAX_SEQUENCE_STEPS).map((h) => h.step);
+  let seenNow = false;
+  for (const step of steps) {
+    if (step.spec?.kind === 'after' && step.spec.minutes === 0) {
+      step.spec.from = seenNow ? 'previous' : 'start';
+      seenNow = true;
+    }
+  }
+
+  return steps.length ? steps : null;
+}
+
+function applyChainedStepFallback(draft: ConversationDraft, text: string): void {
+  const spec = draft.sequenceSpec;
+  if (!spec) return;
+  const fallback = parseChainedSequenceSteps(text);
+  if (!fallback?.length) return;
+
+  const assign = (steps: RawStep[]): RawStep[] => {
+    const count = spec.count;
+    if (count != null && fallback.length > count) {
+      return steps.map((s, i) => (stepIsUsable(s) ? s : fallback[i] ?? s)).slice(0, count);
+    }
+    if (count == null || fallback.length === count) {
+      return steps.map((s, i) => (stepIsUsable(s) ? s : fallback[i] ?? s));
+    }
+    return steps.map((s, i) => (stepIsUsable(s) ? s : fallback[i] ?? s));
+  };
+
+  if (sequenceStepsAreEmpty(spec.steps)) {
+    const count = spec.count;
+    if (count != null && fallback.length > count) {
+      spec.steps = fallback.slice(0, count);
+    } else if (count == null || fallback.length === count) {
+      spec.steps = fallback;
+    } else if (fallback.length < count) {
+      spec.steps = fallback;
+    }
+    return;
+  }
+
+  if (!sequenceStepsNeedFallback(spec.steps)) return;
+
+  const merged = [...spec.steps];
+  for (let i = 0; i < merged.length; i++) {
+    if (!stepIsUsable(merged[i]) && fallback[i]) merged[i] = fallback[i];
+  }
+  const count = spec.count;
+  const targetLen = count ?? Math.max(merged.length, fallback.length);
+  for (let i = merged.length; i < targetLen && i < fallback.length; i++) {
+    merged.push(fallback[i]);
+  }
+  spec.steps = assign(merged);
+}
+
 function seedSequenceFromText(draft: ConversationDraft, text: string): void {
   if (!draft.sequenceSpec) draft.sequenceSpec = { steps: [] };
   const gap = parseIntervalGapMinutes(text);
   if (gap) draft.sequenceSpec.gapMinutes = gap;
-  const count = parseSequenceCount(text);
+  // An explicit "3 mails" always wins; the marker chain only speaks when it says nothing.
+  const count = parseSequenceCount(text) ?? parseChainMarkerCount(text);
   if (count != null) draft.sequenceSpec.count = count;
   if (/\btoday\b/.test(normalize(text))) draft.sequenceSpec.sameDay = true;
+  applyChainedStepFallback(draft, text);
 }
 
 function applySequenceCountAnswer(draft: ConversationDraft, text: string): 'ok' | 'refuse' | 'retry' {
@@ -863,6 +1168,7 @@ function processSequenceDraft(draft: ConversationDraft, text: string, raw?: LlmI
       );
     }
   }
+  applyChainedStepFallback(draft, text);
   resolveSilentStepTimes(draft, workflowTimezone());
   const mat = tryMaterializeSequenceDraft(draft, workflowTimezone());
   if (mat) {
@@ -1137,6 +1443,173 @@ export function matchTemplatesFromText(
   return { kind: 'none' };
 }
 
+function cleanStepTemplateHint(raw: string): string {
+  return normalize(raw)
+    .replace(/\s+and\s*$/i, '')
+    .replace(/\b(again|the|a|an|template|mail|use)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function resolveStepOrdinal(token: string, stepCount: number): number | null {
+  const t = normalize(token);
+  if (/\b(first|1st)\b/.test(t) || t === '1') return 0;
+  if (/\b(second|2nd)\b/.test(t) || t === '2') return 1;
+  if (/\b(third|3rd)\b/.test(t) || t === '3') return 2;
+  if (/\b(fourth|4th)\b/.test(t) || t === '4') return 3;
+  if (/\b(fifth|5th)\b/.test(t) || t === '5') return 4;
+  if (/\b(last|final)\b/.test(t)) return stepCount > 0 ? stepCount - 1 : null;
+  const mailN = t.match(/mail\s*(\d+)/);
+  if (mailN) {
+    const n = Number.parseInt(mailN[1], 10);
+    return n >= 1 && n <= stepCount ? n - 1 : null;
+  }
+  return null;
+}
+
+const STEP_TARGET_TOKENS =
+  'first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|last|final|rest|others|remaining|mail\\s*\\d+';
+const STEP_SPREAD_RE = /^(?:rest|others|remaining)$/i;
+
+/**
+ * "for first mail use introduction, for rest use follow up" — one entry per step. A spread
+ * target ("rest") expands to whatever steps no explicit directive already claimed.
+ */
+function parsePerStepTemplateHints(text: string, stepCount: number): Array<{ index: number; hint: string }> {
+  if (stepCount < 1) return [];
+  const re = new RegExp(
+    `\\bfor\\s+(?:the\\s+)?(${STEP_TARGET_TOKENS})\\s+(?:mails?\\s+)?(?:use\\s+)?(.+?)`
+      + `(?=\\s+for\\s+(?:the\\s+)?(?:${STEP_TARGET_TOKENS})\\s|$)`,
+    'gi',
+  );
+  const hints: Array<{ index: number; hint: string }> = [];
+  const spread: string[] = [];
+  for (const m of text.matchAll(re)) {
+    const hint = cleanStepTemplateHint(m[2]);
+    if (!hint) continue;
+    if (STEP_SPREAD_RE.test(m[1].trim())) {
+      spread.push(hint);
+      continue;
+    }
+    const index = resolveStepOrdinal(m[1], stepCount);
+    if (index == null || index < 0 || index >= stepCount) continue;
+    hints.push({ index, hint });
+  }
+
+  const claimed = new Set(hints.map((h) => h.index));
+  for (const hint of spread) {
+    for (let i = 0; i < stepCount; i++) {
+      if (claimed.has(i)) continue;
+      hints.push({ index: i, hint });
+      claimed.add(i);
+    }
+  }
+  return hints;
+}
+
+function foldTemplateText(s: string): string {
+  return normalize(s).replace(/[-_]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function compactTemplateText(s: string): string {
+  return foldTemplateText(s).replace(/\s+/g, '');
+}
+
+function matchTemplatesForStepHint(
+  hint: string,
+  templates: TemplateRecord[],
+  stepIndex: number,
+): { kind: 'single'; id: string; name: string } | { kind: 'choices'; choices: DraftChoice[] } | { kind: 'none' } {
+  const q = cleanStepTemplateHint(hint);
+  if (!q) return { kind: 'none' };
+  const cq = compactTemplateText(q);
+
+  const contains = templates.filter((t) => {
+    const name = foldTemplateText(t.name);
+    const desc = foldTemplateText(t.description);
+    const cn = compactTemplateText(t.name);
+    const cd = compactTemplateText(t.description);
+    if (name.includes(q) || desc.includes(q) || cn.includes(cq) || cd.includes(cq)) return true;
+    const tokens = q.split(/\s+/).filter((w) => w.length > 1);
+    return tokens.length > 0 && tokens.every((w) => name.includes(w) || desc.includes(w) || cn.includes(compactTemplateText(w)));
+  });
+
+  if (contains.length === 1) {
+    return { kind: 'single', id: contains[0].id, name: contains[0].name };
+  }
+  if (contains.length > 1) {
+    return {
+      kind: 'choices',
+      choices: contains.slice(0, 5).map((t) => ({
+        id: `stepTemplate:${stepIndex}:${t.id}`,
+        label: t.name,
+        sublabel: hint,
+        field: 'stepTemplate' as const,
+        value: t.id,
+      })),
+    };
+  }
+
+  const scored = templates
+    .map((t) => ({ t, score: scoreTemplateMatch(t, q) }))
+    .filter((x) => x.score >= 40)
+    .sort((a, b) => b.score - a.score);
+  if (scored.length === 1) return { kind: 'single', id: scored[0].t.id, name: scored[0].t.name };
+  if (scored.length > 1) {
+    return {
+      kind: 'choices',
+      choices: scored.slice(0, 5).map(({ t }) => ({
+        id: `stepTemplate:${stepIndex}:${t.id}`,
+        label: t.name,
+        sublabel: hint,
+        field: 'stepTemplate' as const,
+        value: t.id,
+      })),
+    };
+  }
+  return { kind: 'none' };
+}
+
+function applyPerStepTemplateHints(
+  draft: ConversationDraft,
+  text: string,
+  templates: TemplateRecord[],
+): Ambiguity | null {
+  let spec = draft.sequenceSpec;
+  const scheduledSteps = draft.schedule?.frequency === 'sequence' ? draft.schedule.steps ?? [] : [];
+  const stepCount = spec?.count ?? spec?.steps.length ?? scheduledSteps.length;
+  if (stepCount < 2) return null;
+
+  const hints = parsePerStepTemplateHints(text, stepCount);
+  if (!hints.length) return null;
+  if (!spec && scheduledSteps.length) {
+    spec = {
+      count: scheduledSteps.length,
+      steps: scheduledSteps.map((step) => ({
+        spec: step.spec,
+        ...(step.templateId ? { templateId: step.templateId } : {}),
+      })),
+    };
+    draft.sequenceSpec = spec;
+    draft.schedule = undefined;
+  }
+  if (!spec) return null;
+
+  for (const { index, hint } of hints) {
+    if (spec.steps[index]?.templateId) continue;
+    const match = matchTemplatesForStepHint(hint, templates, index);
+    if (match.kind === 'single') {
+      if (!spec.steps[index]) spec.steps[index] = {};
+      spec.steps[index].templateId = match.id;
+      continue;
+    }
+    if (match.kind === 'choices') {
+      return { kind: 'stepTemplate', stepIndex: index, hint, choices: match.choices };
+    }
+  }
+  return null;
+}
+
 function scoreLead(
   lead: { contactName: string; companyName: string; contactEmail: string },
   hint: string,
@@ -1230,6 +1703,10 @@ export function choiceFieldStillOpen(draft: ConversationDraft): boolean {
   if (field === 'recipientId') return !draft.recipientIds.length;
   if (field === 'anchor') return !draft.sequenceSpec?.anchor;
   if (field === 'stepTime') return true;
+  if (field === 'stepTemplate') {
+    const idx = Number(draft.pendingChoices?.[0]?.id.split(':')[1] ?? -1);
+    return idx >= 0 && !draft.sequenceSpec?.steps[idx]?.templateId;
+  }
   return false;
 }
 
@@ -1246,6 +1723,11 @@ function applyChoice(draft: ConversationDraft, choice: DraftChoice): Conversatio
       draft.sequenceSpec.steps[idx].spec = { kind: 'at', time: choice.value, dayOffset: 0 };
       draft.sequenceSpec.steps[idx].candidates = undefined;
     }
+  } else if (choice.field === 'stepTemplate') {
+    const idx = Number(choice.id.split(':')[1] ?? 0);
+    if (!draft.sequenceSpec) draft.sequenceSpec = { steps: [] };
+    if (!draft.sequenceSpec.steps[idx]) draft.sequenceSpec.steps[idx] = {};
+    draft.sequenceSpec.steps[idx].templateId = choice.value;
   } else if (!draft.recipientIds.includes(choice.value)) {
     draft.recipientIds = [...draft.recipientIds, choice.value];
   }
@@ -1476,6 +1958,7 @@ function candidatesForAction(workflows: MailWorkflow[], action: WorkflowAction):
   return workflows.filter((wf) => {
     if (action === 'pause') return wf.status === 'active';
     if (action === 'resume') return wf.status === 'paused';
+    if (action === 'update') return wf.status === 'active' || wf.status === 'paused';
     if (action === 'cancel') return wf.status !== 'completed' && wf.status !== 'cancelled';
     return false;
   });
@@ -1484,7 +1967,35 @@ function candidatesForAction(workflows: MailWorkflow[], action: WorkflowAction):
 function noCandidatesMessage(action: WorkflowAction): string {
   if (action === 'pause') return 'You do not have any active recurring emails to pause.';
   if (action === 'resume') return 'You do not have any paused emails to resume.';
+  if (action === 'update') return 'You do not have any active sequences to edit.';
   return 'You do not have any scheduled emails to cancel.';
+}
+
+function mergeWorkflowIntoDraft(draft: ConversationDraft, wf: MailWorkflow): void {
+  draft.action = 'update';
+  draft.workflowId = wf.id;
+  if (!draft.templateId) draft.templateId = wf.templateId;
+  if (!draft.recipientIds.length) draft.recipientIds = [...wf.recipientIds];
+  if (!draft.schedule) draft.schedule = modelScheduleToContract(wf.schedule);
+  if (!Object.keys(draft.variables).length) draft.variables = { ...wf.variables };
+  if (draft.schedule?.frequency === 'sequence') draft.sequenceRequested = true;
+}
+
+function updateDraftHasChanges(draft: ConversationDraft, wf: MailWorkflow): boolean {
+  if (draft.templateId && draft.templateId !== wf.templateId) return true;
+  if (
+    draft.recipientIds.length
+    && JSON.stringify(draft.recipientIds) !== JSON.stringify(wf.recipientIds)
+  ) {
+    return true;
+  }
+  if (
+    draft.schedule
+    && JSON.stringify(draft.schedule) !== JSON.stringify(modelScheduleToContract(wf.schedule))
+  ) {
+    return true;
+  }
+  return false;
 }
 
 async function resolveWorkflowId(userId: string, draft: ConversationDraft): Promise<string> {
@@ -1587,13 +2098,27 @@ async function handleManagementAction(
   }
 
   const action = draft.action;
+  if (action === 'update') {
+    const wf = await getWorkflow(userId, workflowId);
+    mergeWorkflowIntoDraft(draft, wf);
+    if (!updateDraftHasChanges(draft, wf)) {
+      await saveDraft(userId, draft);
+      return {
+        kind: 'assistant_message',
+        message:
+          assistantReply?.trim()
+          || 'What should I change — a step time, template, or recipient?',
+        suggestions: ['Move step 2 to 4pm', 'Change the template on step 3'],
+      };
+    }
+    return handleCreateDraft(userId, draft, requestId, assistantReply);
+  }
+
   if (action !== 'pause' && action !== 'resume' && action !== 'cancel') {
     await clearDraft(userId);
     return {
       kind: 'assistant_message',
-      message:
-        "I can't edit an existing scheduled email yet. Cancel it and I'll set up a new one with the changes.",
-      suggestions: ['Cancel it', 'Show my scheduled emails'],
+      message: 'I did not understand that command. Try pause, resume, cancel, or edit.',
     };
   }
 
@@ -1644,6 +2169,13 @@ async function handleCreateDraft(
     const question =
       first.field === 'stepTime'
         ? `Which time did you mean — ${draft.pendingChoices.map((c) => c.label).join(' or ')}?`
+        : first.field === 'stepTemplate'
+          ? (() => {
+              const stepNum = Number(first.id.split(':')[1]) + 1;
+              const hint = first.sublabel ?? 'that';
+              const names = draft.pendingChoices.map((c) => c.label).join(', ');
+              return `I found multiple templates for ${hint} on step ${stepNum}: ${names}. Which one should I use?`;
+            })()
         : first.field === 'anchor'
           ? 'Starting today, or after the first gap?'
           : first.field === 'templateId'
@@ -1668,19 +2200,16 @@ async function handleCreateDraft(
         field: 'stepTime' as const,
         value: c,
       }));
+    } else if (amb.kind === 'stepTemplate') {
+      draft.pendingChoices = amb.choices;
     }
     const count = noteAsked(draft, 'schedule');
-    let question: string;
-    if (amb.kind === 'count') {
-      question =
-        count <= 1
+    const question =
+      amb.kind === 'count'
+        ? count <= 1
           ? 'How many sends do you want in this sequence?'
-          : 'How many sends should the sequence include?';
-    } else if (amb.kind === 'anchor') {
-      question = 'Starting today, or after the first gap?';
-    } else {
-      question = `Which time did you mean — ${amb.candidates.map(formatClockLabel).join(' or ')}?`;
-    }
+          : 'How many sends should the sequence include?'
+        : sequenceAmbiguityQuestion(amb);
     await saveDraft(userId, draft);
     return {
       kind: 'assistant_message',
@@ -1738,11 +2267,19 @@ async function handleCreateDraft(
   const preflight = await inboxPreflight(userId);
   const preview = await buildDraftPreview(userId, contract);
 
-  toAwaitingCreateConfirmation(draft, confirmRequestId);
+  if (draft.action === 'update' && draft.workflowId) {
+    toAwaitingUpdateConfirmation(draft, draft.workflowId, confirmRequestId);
+  } else {
+    toAwaitingCreateConfirmation(draft, confirmRequestId);
+  }
   refreshDraftSteps(draft, extraMissing);
   await saveDraft(userId, draft);
 
-  const confirmAction = { type: 'schedule' as const, label: confirmLabelFor(draft.schedule) };
+  const confirmAction = {
+    type: (draft.action === 'update' ? 'update' : 'schedule') as 'schedule' | 'update',
+    label: draft.action === 'update' ? 'Confirm changes' : confirmLabelFor(draft.schedule),
+    ...(draft.action === 'update' && draft.workflowId ? { workflowId: draft.workflowId } : {}),
+  };
 
   if (!preflight.connected) {
     return {
@@ -1821,6 +2358,34 @@ export async function confirmPendingChat(
 
   const requestId = draft.confirmRequestId ?? fallbackRequestId;
   const kind = draft.awaitingConfirmation;
+
+  if (kind === 'update') {
+    const workflowId = draft.confirmationWorkflowId ?? draft.workflowId;
+    if (!workflowId) {
+      await clearDraft(userId);
+      return {
+        kind: 'assistant_message',
+        message: 'That confirmation expired. Please run the command again.',
+      };
+    }
+    if (!draftIsComplete(draft)) {
+      toEditing(draft);
+      await saveDraft(userId, draft);
+      return {
+        kind: 'assistant_message',
+        message: "Something is missing from that edit — let's fill it in before I apply anything.",
+      };
+    }
+    const contract = draftToContract(draft, requestId);
+    const workflow = await updateWorkflow(userId, workflowId, contract);
+    await clearDraft(userId);
+    const template = await loadTemplate(userId, workflow.templateId);
+    return {
+      kind: 'assistant_message',
+      message: `Updated **${template.name}**.`,
+      workflows: [workflow],
+    };
+  }
 
   if (kind !== 'create') {
     const workflowId = draft.confirmationWorkflowId;
@@ -1902,7 +2467,7 @@ async function handleAwaitingConfirmationText(
   // Confirmation is action-specific. "send it" is a perfectly good yes for a send, and a
   // terrible one for "are you sure you want to cancel this workflow?" — it reads as the
   // opposite of what it would do. Management actions need an unambiguous yes.
-  if (draft.awaitingConfirmation !== 'create') {
+  if (draft.awaitingConfirmation !== 'create' && draft.awaitingConfirmation !== 'update') {
     if (isExplicitYes(text)) return confirmPendingChat(userId, requestId);
     const label = draft.awaitingConfirmation ?? 'this change';
     return {
@@ -2274,6 +2839,7 @@ export async function handleChatMessage(
   draft = await getDraft(userId);
 
   const inCreateFlow = isActiveCreateFlow(draft) || draft.action === 'create';
+  const cadenceIntent = recurringCadenceIntent(text);
 
   // ---- picking from an outstanding shortlist, ahead of everything ----
   // Must beat parseWhen: while "which one did you mean?" is open, a bare "2" is a
@@ -2287,6 +2853,21 @@ export async function handleChatMessage(
       await saveDraft(userId, draft);
       const resolved = await resolveDraft(userId, draft);
       return handleCreateDraft(userId, resolved.draft, requestId, undefined, resolved.autoTemplateName);
+    }
+    if (field === 'stepTemplate') {
+      const tplMatch = matchTemplatesFromText(
+        text,
+        draft.pendingChoices.map((c) => ({ id: c.value, name: c.label, description: '' })),
+      );
+      if (tplMatch.kind === 'single') {
+        const choice = draft.pendingChoices.find((c) => c.value === tplMatch.id);
+        if (choice) {
+          draft = applyChoice(draft, choice);
+          await saveDraft(userId, draft);
+          const resolved = await resolveDraft(userId, draft);
+          return handleCreateDraft(userId, resolved.draft, requestId, undefined, resolved.autoTemplateName);
+        }
+      }
     }
     if (field === 'stepTime') {
       const match = matchStepTimeCandidate(text, draft.pendingChoices.map((c) => c.value));
@@ -2344,7 +2925,12 @@ export async function handleChatMessage(
     return handleCreateDraft(userId, draft, requestId, aside);
   }
 
-  if (inCreateFlow && looksLikeSequence(text)) {
+  if (inCreateFlow && cadenceIntent != null && draft.sequenceSpec?.count == null) {
+    draft.sequenceRequested = false;
+    draft.sequenceSpec = undefined;
+  }
+
+  if (inCreateFlow && cadenceIntent == null && looksLikeSequence(text)) {
     draft.sequenceRequested = true;
     seedSequenceFromText(draft, text);
     toCollecting(draft);
@@ -2359,7 +2945,10 @@ export async function handleChatMessage(
   }
 
   // ---- deterministic time parsing, ahead of the model ----
-  const when = draft.sequenceRequested ? null : parseWhen(text, timezone);
+  const customRecurringGap = cadenceIntent === 'clarify' && parseIntervalGapMinutes(text) != null;
+  const when = draft.sequenceRequested || customRecurringGap
+    ? null
+    : parseWhen(text.replace(/\b(?:12\s+)?noon\b/gi, '12 pm'), timezone);
   if (when && draft.action === 'create') {
     // "send it now" with nothing collected must NOT send — it just records the intent.
     draft.schedule = when.schedule;
@@ -2425,21 +3014,23 @@ export async function handleChatMessage(
         }
       }
       processSequenceDraft(draft, text, parsed);
+      const templates = await templateRecords(userId);
+      const tplAmb = applyPerStepTemplateHints(draft, text, templates);
+      if (tplAmb?.kind === 'stepTemplate') {
+        draft.pendingChoices = tplAmb.choices;
+      } else {
+        const mat = tryMaterializeSequenceDraft(draft, workflowTimezone());
+        if (mat) {
+          draft.schedule = mat;
+          draft.sequenceSpec = undefined;
+        }
+      }
     }
     if (draft.action === 'update') {
-      // There is no edit-in-place flow; never route `update` into workflow disambiguation.
       if (inCreateFlow) {
         draft.action = 'create';
         draft.workflowHint = undefined;
         draft.workflowId = undefined;
-      } else {
-        await clearDraft(userId);
-        return {
-          kind: 'assistant_message',
-          message:
-            "I can't change an existing scheduled email yet. Cancel it and I'll set up a new one with your changes.",
-          suggestions: ['Cancel it', 'Show my scheduled emails'],
-        };
       }
     }
   } catch (err) {
@@ -2460,12 +3051,28 @@ export async function handleChatMessage(
     throw err;
   }
 
+  if (draft.action === 'update') {
+    if (!draft.workflowId) {
+      return handleManagementAction(userId, draft, requestId, assistantReply);
+    }
+    const resolved = await resolveDraft(userId, draft);
+    draft = refreshDraftSteps(resolved.draft);
+    return handleCreateDraft(userId, draft, requestId, assistantReply, resolved.autoTemplateName);
+  }
+
   if (draft.action !== 'create') {
     return handleManagementAction(userId, draft, requestId, assistantReply);
   }
 
   const resolved = await resolveDraft(userId, draft);
   draft = refreshDraftSteps(resolved.draft);
+  if (cadenceIntent === 'clarify') {
+    draft.sequenceRequested = false;
+    draft.sequenceSpec = undefined;
+    if (customRecurringGap) draft.schedule = undefined;
+    await saveDraft(userId, draft);
+    return { kind: 'assistant_message', message: RECURRING_MODE_QUESTION };
+  }
   return handleCreateDraft(userId, draft, requestId, assistantReply, resolved.autoTemplateName);
 }
 
@@ -2660,6 +3267,21 @@ if (process.argv[1]?.endsWith('chat-parser.ts')) {
 
   assert.equal(looksLikeSequence('every 2 days'), true);
   assert.equal(looksLikeSequence('every day at 10am'), false);
+  const recurringBugText =
+    'create a sequence for prakhar send one introduction mail now then follow up mail daily at 12 noon';
+  assert.equal(recurringCadenceIntent(recurringBugText), 'clarify');
+  assert.notEqual(
+    recurringCadenceIntent(recurringBugText),
+    null,
+    'mixed now-then-daily intent must bypass the generic sequence count branch',
+  );
+  assert.equal(recurringCadenceIntent('send the follow-up daily at 12 noon'), 'recurring');
+  assert.equal(recurringCadenceIntent('send the follow-up every 2 days'), 'clarify');
+  assert.equal(
+    parseWhen(recurringBugText.replace(/\b(?:12\s+)?noon\b/gi, '12 pm'), 'Asia/Kolkata')?.schedule.time,
+    '12:00',
+  );
+  assert.equal(parseSequenceCount('send 4 mails daily'), 4, 'explicit finite sequence count still wins');
 
   // --- test 42: single-send regression (same schedule as pre-sequence work) ---
   const singleTz = 'Asia/Kolkata';
@@ -2782,6 +3404,261 @@ if (process.argv[1]?.endsWith('chat-parser.ts')) {
       );
     }
     assert.equal(tryMaterializeSequenceDraft(around78, singleTz), null, 'step-time ambiguity blocks materialization');
+  });
+
+  // --- chained-step fallback ---
+  const userLike = 'create a 3 mails today to prakhar one now one 2 hours later and next at 5';
+  assert.equal(looksLikeSequence(userLike), true);
+  const chained = parseChainedSequenceSteps(userLike);
+  assert.equal(chained?.length, 3);
+  assert.equal(chained![0].spec?.kind, 'after');
+  if (chained![0].spec?.kind === 'after') assert.equal(chained![0].spec.minutes, 0);
+  if (chained![0].spec?.kind === 'after') assert.equal(chained![0].spec.from, 'start');
+  if (chained![1].spec?.kind === 'after') assert.equal(chained![1].spec.minutes, 120);
+  assert.ok(chained![2].candidates?.length === 2 || chained![2].spec?.kind === 'at');
+  assert.deepEqual(parseChainedSequenceSteps('first now then at 5')?.[1]?.candidates, ['05:00', '17:00']);
+
+  withFrozenNow('2026-08-21T02:30:00.000Z', () => {
+    const fbDraft = emptyDraft();
+    fbDraft.sequenceRequested = true;
+    processSequenceDraft(fbDraft, userLike);
+    const amb = nextAmbiguity(fbDraft);
+    const materialized = fbDraft.schedule?.frequency === 'sequence';
+    assert.ok(
+      materialized || amb?.kind === 'stepTime',
+      'user-like sentence must materialize or ask stepTime, not generic schedule',
+    );
+    if (materialized) {
+      assert.equal(fbDraft.schedule?.steps?.length, 3);
+      assert.equal(fbDraft.sequenceSpec, undefined, 'materialized draft clears sequenceSpec');
+    }
+
+    const llmShellDraft = emptyDraft();
+    llmShellDraft.sequenceRequested = true;
+    processSequenceDraft(llmShellDraft, userLike, {
+      schedule: { frequency: 'sequence', steps: [{}, {}, {}] },
+    });
+    assert.ok(
+      llmShellDraft.schedule?.steps?.length === 3
+        || llmShellDraft.sequenceSpec?.steps.every(stepIsUsable),
+      'empty-shell LLM steps must be replaced by deterministic fallback steps',
+    );
+  });
+
+  const mismatchDraft = emptyDraft();
+  mismatchDraft.sequenceRequested = true;
+  mismatchDraft.sequenceSpec = {
+    count: 3,
+    steps: parseChainedSequenceSteps('now and 2 hours later')!,
+  };
+  assert.equal(mismatchDraft.sequenceSpec.steps.length, 2);
+  assert.equal(
+    tryMaterializeSequenceDraft(mismatchDraft, singleTz),
+    null,
+    'count mismatch must not materialize a short chain',
+  );
+  const mismatchAmb = nextAmbiguity(mismatchDraft);
+  assert.equal(mismatchAmb?.kind, 'stepCountMismatch');
+  if (mismatchAmb?.kind === 'stepCountMismatch') {
+    assert.match(sequenceAmbiguityQuestion(mismatchAmb), /2 of 3/);
+    assert.match(sequenceAmbiguityQuestion(mismatchAmb), /3rd/);
+    assert.doesNotMatch(sequenceAmbiguityQuestion(mismatchAmb), /How should the sequence go/i);
+  }
+
+  const shellDraft = emptyDraft();
+  shellDraft.sequenceRequested = true;
+  shellDraft.sequenceSpec = {
+    count: 3,
+    steps: [
+      { spec: { kind: 'after', minutes: 0, from: 'start' } },
+      {},
+      {},
+    ],
+  };
+  applyChainedStepFallback(shellDraft, 'now one 2 hours later and next at 5');
+  assert.equal(stepIsUsable(shellDraft.sequenceSpec!.steps[1]), true, 'empty shell step 2 filled by fallback');
+  assert.equal(stepIsUsable(shellDraft.sequenceSpec!.steps[2]), true, 'empty shell step 3 filled by fallback');
+
+  withFrozenNow('2026-08-21T11:30:00.000Z', () => {
+    const sameDayDraft = emptyDraft();
+    sameDayDraft.sequenceRequested = true;
+    sameDayDraft.sequenceSpec = {
+      count: 3,
+      sameDay: true,
+      steps: [
+        { spec: { kind: 'after', minutes: 0, from: 'start' } },
+        { spec: { kind: 'after', minutes: 120, from: 'previous' } },
+        { spec: { kind: 'at', time: '17:00', dayOffset: 0 } },
+      ],
+    };
+    assert.equal(tryMaterializeSequenceDraft(sameDayDraft, singleTz), null, 'sameDay late chain must not materialize');
+    const sameDayAmb = nextAmbiguity(sameDayDraft);
+    assert.equal(sameDayAmb?.kind, 'sameDayConflict');
+    if (sameDayAmb?.kind === 'sameDayConflict') {
+      assert.match(sequenceAmbiguityQuestion(sameDayAmb), /after midnight/i);
+      assert.doesNotMatch(sequenceAmbiguityQuestion(sameDayAmb), /How should the sequence go/i);
+    }
+  });
+
+  const stepTplMocks: TemplateRecord[] = [
+    { id: 'intro', name: 'Introduction', description: '' },
+    { id: 'follow1', name: 'Follow-up 1', description: 'follow up note' },
+    { id: 'follow2', name: 'Quotation Follow-up', description: '' },
+  ];
+  const stepTplUnique: TemplateRecord[] = [
+    { id: 'intro', name: 'Introduction', description: '' },
+    { id: 'follow1', name: 'Follow-up 1', description: '' },
+    { id: 'closing', name: 'Closing Note', description: '' },
+  ];
+  const perStepText =
+    'for first mail use introduction for second use followup and for last use again introduction';
+  const perStepHints = parsePerStepTemplateHints(perStepText, 3);
+  assert.equal(perStepHints.length, 3);
+  assert.equal(perStepHints[0].hint, 'introduction');
+  assert.equal(perStepHints[1].hint, 'followup');
+  assert.equal(perStepHints[2].hint, 'introduction');
+  assert.deepEqual(perStepHints.map((hint) => hint.index), [0, 1, 2], 'template hints keep user-stated step order');
+  const perStepDraft = emptyDraft();
+  perStepDraft.sequenceRequested = true;
+  perStepDraft.sequenceSpec = { count: 3, steps: [{}, {}, {}] };
+  assert.equal(applyPerStepTemplateHints(perStepDraft, perStepText, stepTplUnique), null);
+  assert.equal(perStepDraft.sequenceSpec!.steps[0].templateId, 'intro');
+  assert.equal(perStepDraft.sequenceSpec!.steps[1].templateId, 'follow1');
+  assert.equal(perStepDraft.sequenceSpec!.steps[2].templateId, 'intro');
+  const materializedPerStepDraft = emptyDraft();
+  materializedPerStepDraft.sequenceRequested = true;
+  materializedPerStepDraft.schedule = validSeq!;
+  assert.equal(applyPerStepTemplateHints(materializedPerStepDraft, perStepText, stepTplUnique), null);
+  const rematerializedPerStep = tryMaterializeSequenceDraft(materializedPerStepDraft, singleTz);
+  assert.deepEqual(
+    rematerializedPerStep?.steps?.map((step) => step.templateId),
+    ['intro', 'follow1', 'intro'],
+    'per-step directives override a sequence already materialized from the LLM',
+  );
+  const ambTpl = matchTemplatesForStepHint('followup', stepTplMocks, 1);
+  assert.equal(ambTpl.kind, 'choices');
+  if (ambTpl.kind === 'choices') {
+    assert.equal(ambTpl.choices.length, 2);
+    assert.match(ambTpl.choices[0].id, /^stepTemplate:1:/);
+  }
+  const ambStepDraft = emptyDraft();
+  ambStepDraft.sequenceSpec = { count: 3, steps: [{ templateId: 'intro' }, {}, {}] };
+  const ambStep = applyPerStepTemplateHints(ambStepDraft, perStepText, stepTplMocks);
+  assert.equal(ambStep?.kind, 'stepTemplate');
+  if (ambStep?.kind === 'stepTemplate') {
+    assert.equal(ambStep.stepIndex, 1);
+    assert.match(sequenceAmbiguityQuestion(ambStep), /multiple templates for followup on step 2/i);
+    assert.match(sequenceAmbiguityQuestion(ambStep), /Follow-up 1/);
+  }
+
+  // --- the reported loop: "one now / one 2 hours later / one at 5" carries its own count ---
+  const chainBugText =
+    'send mail to prakhar one right now one 2 hours later one at 5 in evening '
+    + 'and for first mail use introduction template for rest use follow up';
+  assert.equal(parseSequenceCount(chainBugText), null, 'the sentence names no numeric count');
+  assert.equal(parseChainMarkerCount(chainBugText), 3, 'three explicit step markers mean three sends');
+  assert.equal(looksLikeSequence(chainBugText), true);
+
+  const chainSeed = emptyDraft();
+  chainSeed.sequenceRequested = true;
+  seedSequenceFromText(chainSeed, chainBugText);
+  assert.equal(chainSeed.sequenceSpec?.count, 3, 'the marker chain seeds the count');
+  assert.equal(chainSeed.sequenceSpec?.steps.length, 3);
+
+  withFrozenNow('2026-08-21T02:30:00.000Z', () => {
+    const chainDraft = emptyDraft();
+    chainDraft.sequenceRequested = true;
+    processSequenceDraft(chainDraft, chainBugText);
+    const chainAmb = nextAmbiguity(chainDraft);
+    assert.notEqual(chainAmb?.kind, 'count', 'the marker chain must never re-ask "how many sends"');
+    assert.notEqual(chainAmb?.kind, 'stepCountMismatch', 'all three steps parse out of the chain');
+    assert.ok(
+      chainDraft.schedule?.frequency === 'sequence' || chainAmb?.kind === 'stepTime',
+      'the sentence materializes or asks which 5 o clock — never a generic count',
+    );
+
+    const chainShellDraft = emptyDraft();
+    chainShellDraft.sequenceRequested = true;
+    processSequenceDraft(chainShellDraft, chainBugText, {
+      schedule: { frequency: 'sequence', steps: [{}, {}, {}] },
+    });
+    assert.notEqual(nextAmbiguity(chainShellDraft)?.kind, 'count', 'empty-shell LLM steps still keep the count');
+    assert.ok(
+      chainShellDraft.schedule?.steps?.length === 3
+        || chainShellDraft.sequenceSpec?.steps.every(stepIsUsable),
+      'empty-shell LLM steps are filled by the deterministic chain, not left as placeholders',
+    );
+  });
+
+  const explicitOverMarkers = emptyDraft();
+  explicitOverMarkers.sequenceRequested = true;
+  seedSequenceFromText(explicitOverMarkers, 'send 2 mails one now one 2 hours later one at 5');
+  assert.equal(explicitOverMarkers.sequenceSpec?.count, 2, 'an explicit "2 mails" outranks 3 markers');
+
+  for (const prose of [
+    'send the intro template to rahul tomorrow at 3pm',
+    'one of our leads wants a quote now',
+    'no one now and no one later',
+    'i will send one now',
+  ]) {
+    assert.equal(parseChainMarkerCount(prose), null, `prose must not infer a count: ${prose}`);
+  }
+
+  // --- "for first ... for rest ..." assigns a template per step ---
+  const restHints = parsePerStepTemplateHints(chainBugText, 3);
+  assert.deepEqual(restHints.map((h) => h.index), [0, 1, 2], '"rest" covers every unclaimed step');
+  assert.deepEqual(
+    restHints.map((h) => h.hint),
+    ['introduction', 'follow up', 'follow up'],
+    'partial template names survive the directive split',
+  );
+
+  const restUnique = emptyDraft();
+  restUnique.sequenceRequested = true;
+  restUnique.sequenceSpec = { count: 3, steps: [{}, {}, {}] };
+  assert.equal(applyPerStepTemplateHints(restUnique, chainBugText, stepTplUnique), null);
+  assert.deepEqual(
+    restUnique.sequenceSpec!.steps.map((s) => s.templateId),
+    ['intro', 'follow1', 'follow1'],
+    'a unique partial resolves for both the named step and the rest',
+  );
+  assert.equal(matchTemplatesForStepHint('INTRO', stepTplUnique, 0).kind, 'single');
+  const upperFollow = matchTemplatesForStepHint('Follow Up', stepTplUnique, 1);
+  assert.equal(upperFollow.kind, 'single', 'partial matching ignores case and hyphens');
+  if (upperFollow.kind === 'single') assert.equal(upperFollow.id, 'follow1');
+
+  const restAmbDraft = emptyDraft();
+  restAmbDraft.sequenceRequested = true;
+  restAmbDraft.sequenceSpec = { count: 3, steps: [{}, {}, {}] };
+  const restAmb = applyPerStepTemplateHints(restAmbDraft, chainBugText, stepTplMocks);
+  assert.equal(restAmb?.kind, 'stepTemplate', '"follow up" matching two templates must ask, not guess');
+  if (restAmb?.kind === 'stepTemplate') {
+    assert.equal(restAmb.stepIndex, 1);
+    assert.equal(restAmb.choices.length, 2);
+    assert.match(restAmb.choices[0].id, /^stepTemplate:1:/);
+    assert.match(sequenceAmbiguityQuestion(restAmb), /Follow-up 1/);
+  }
+  assert.equal(
+    restAmbDraft.sequenceSpec!.steps[0].templateId,
+    'intro',
+    'the unambiguous step stays resolved while the ambiguous one is asked about',
+  );
+
+  const at5AmbDraft = emptyDraft();
+  at5AmbDraft.sequenceRequested = true;
+  at5AmbDraft.sequenceSpec = {
+    count: 2,
+    steps: [
+      { spec: { kind: 'after', minutes: 0, from: 'start' } },
+      { candidates: ['05:00', '17:00'] },
+    ],
+  };
+  withFrozenNow('2026-08-20T22:30:00.000Z', () => {
+    const at5Amb = nextAmbiguity(at5AmbDraft);
+    assert.equal(at5Amb?.kind, 'stepTime');
+    if (at5Amb?.kind === 'stepTime') {
+      assert.deepEqual(at5Amb.candidates, ['05:00', '17:00'], 'bare "at 5" keeps AM/PM candidates when both are clean');
+    }
   });
 
   const createFlowSource = handleCreateDraft.toString();

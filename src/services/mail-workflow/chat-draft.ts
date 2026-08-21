@@ -20,13 +20,16 @@ export type SequenceSpec = {
 export type Ambiguity =
   | { kind: 'count' }
   | { kind: 'anchor'; gapMinutes: number; count: number }
-  | { kind: 'stepTime'; stepIndex: number; candidates: string[] };
+  | { kind: 'stepTime'; stepIndex: number; candidates: string[] }
+  | { kind: 'stepCountMismatch'; parsed: number; expected: number; missingSteps: number[] }
+  | { kind: 'sameDayConflict'; stepIndex: number }
+  | { kind: 'stepTemplate'; stepIndex: number; hint: string; choices: DraftChoice[] };
 
 export type DraftChoice = {
   id: string;
   label: string;
   sublabel?: string;
-  field: 'templateId' | 'recipientId' | 'anchor' | 'stepTime';
+  field: 'templateId' | 'recipientId' | 'anchor' | 'stepTime' | 'stepTemplate';
   value: string;
 };
 
@@ -67,7 +70,7 @@ export type ConversationDraft = {
   workflowHint?: string;
   pendingChoices?: DraftChoice[];
   /** Which confirmation is outstanding. Only meaningful in `awaiting_confirmation`. */
-  awaitingConfirmation?: 'create' | 'pause' | 'resume' | 'cancel';
+  awaitingConfirmation?: 'create' | 'update' | 'pause' | 'resume' | 'cancel';
   confirmationWorkflowId?: string;
   /**
    * Minted when a preview is shown and reused by every confirmation path (button and
@@ -226,6 +229,20 @@ export function toAwaitingCreateConfirmation(
   draft.state = 'awaiting_confirmation';
   draft.awaitingConfirmation = 'create';
   // Mint once and keep it: every confirmation attempt reuses this id.
+  draft.confirmRequestId = draft.confirmRequestId ?? confirmRequestId;
+  return refreshDraftSteps(draft);
+}
+
+export function toAwaitingUpdateConfirmation(
+  draft: ConversationDraft,
+  workflowId: string,
+  confirmRequestId: string,
+): ConversationDraft {
+  draft.state = 'awaiting_confirmation';
+  draft.action = 'update';
+  draft.workflowId = workflowId;
+  draft.awaitingConfirmation = 'update';
+  draft.confirmationWorkflowId = workflowId;
   draft.confirmRequestId = draft.confirmRequestId ?? confirmRequestId;
   return refreshDraftSteps(draft);
 }

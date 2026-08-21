@@ -168,7 +168,7 @@ async function claimRunForExecution(now: Date): Promise<MailWorkflowRunDocument 
         sendState: 'sending',
       },
     },
-    { new: true, sort: { nextAttemptAt: 1, createdAt: 1 } },
+    { returnDocument: 'after', sort: { nextAttemptAt: 1, createdAt: 1 } },
   ).lean();
 }
 

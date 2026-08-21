@@ -265,7 +265,7 @@ async function testConcurrentLeaseClaim(): Promise<void> {
         $or: [{ leaseUntil: null }, { leaseUntil: { $lte: now } }],
       },
       { $set: { leaseOwner: `worker-${randomUUID()}`, lockId: randomUUID(), leaseUntil: new Date(now.getTime() + 60_000) } },
-      { new: true },
+      { returnDocument: 'after' },
     ).lean();
 
   const claims = await Promise.all([claim(), claim(), claim(), claim()]);

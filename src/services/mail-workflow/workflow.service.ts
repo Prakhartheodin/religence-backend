@@ -438,8 +438,8 @@ async function buildPreviewInternal(
   contract: WorkflowCommandContractV1,
   opts: { requireAuth: boolean },
 ): Promise<PreviewSummary> {
-  if (contract.action !== 'create') {
-    throw new WorkflowError('CONTRACT_INVALID', 'preview only supports create');
+  if (contract.action !== 'create' && contract.action !== 'update') {
+    throw new WorkflowError('CONTRACT_INVALID', 'preview only supports create or update');
   }
   const { templateId, recipientIds } = contract;
   if (!templateId || !recipientIds?.length) {
@@ -703,7 +703,7 @@ export async function pauseWorkflow(
     const wf = await MailWorkflowModel.findOneAndUpdate(
       { userId, id: workflowId, status: 'active' },
       { $set: { status: 'paused', leaseOwner: null, leaseUntil: null, lockId: null } },
-      { new: true },
+      { returnDocument: 'after' },
     ).lean();
     if (wf) {
       mailLog.info('workflow.paused', { workspaceId: userId, userId, workflowId, requestId });
@@ -746,7 +746,7 @@ export async function resumeWorkflow(
     const wf = await MailWorkflowModel.findOneAndUpdate(
       { userId, id: workflowId, status: 'paused' },
       { $set: { status: 'active', nextRunAt: resumeAt } },
-      { new: true },
+      { returnDocument: 'after' },
     ).lean();
     if (!wf) throw await explainFailedTransition(userId, workflowId, 'resume');
     mailLog.info('workflow.resumed', { workspaceId: userId, userId, workflowId, requestId });
@@ -771,7 +771,7 @@ export async function cancelWorkflow(
           lockId: null,
         },
       },
-      { new: true },
+      { returnDocument: 'after' },
     ).lean();
     if (!wf) throw await explainFailedTransition(userId, workflowId, 'cancel');
     mailLog.info('workflow.cancelled', { workspaceId: userId, userId, workflowId, requestId });
@@ -792,6 +792,9 @@ export async function updateWorkflow(
     async () => {
       const wf = await MailWorkflowModel.findOne({ userId, id: workflowId });
       if (!wf) throw new WorkflowError('WORKFLOW_NOT_FOUND', 'workflow not found');
+      if (TERMINAL_STATUSES.has(wf.status)) {
+        throw new WorkflowError('CONTRACT_INVALID', 'cannot edit a completed or cancelled workflow');
+      }
 
       if (contract.templateId) {
         await loadTemplate(userId, contract.templateId);
@@ -817,7 +820,11 @@ export async function updateWorkflow(
       assertExtraVars(template, variablesFromDoc(wf.variables));
 
       if (wf.status === 'active' && contract.schedule) {
-        wf.nextRunAt = firstRunAt(modelScheduleToContract(wf.schedule), wf.timezone);
+        const schedule = modelScheduleToContract(wf.schedule);
+        wf.nextRunAt =
+          schedule.frequency === 'sequence'
+            ? computeNextRunAt(schedule, wf.timezone, new Date())
+            : firstRunAt(schedule, wf.timezone);
       }
 
       await wf.save();

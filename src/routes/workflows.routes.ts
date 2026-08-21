@@ -2,6 +2,7 @@ import { Router, type Request } from 'express';
 import { HttpError } from '../http-error.js';
 import { WorkflowError, parseContract, type RunStatus } from '../services/mail-workflow/contract.js';
 import { listMailHistory, resolveMailLink } from '../services/mail-workflow/mail-history.js';
+import { buildSequenceProgress, listSequenceProgress } from '../services/mail-workflow/sequence-progress.js';
 import {
   cancelWorkflow,
   confirmWorkflow,
@@ -75,6 +76,25 @@ workflowsRouter.get('/needs-review', async (req, res, next) => {
  * Per-contact mail timeline. MUST stay above the `/:id` route below, or Express hands
  * "mail-history" to it as a workflow id.
  */
+/** In-progress multi-step sequences with per-step send status. */
+workflowsRouter.get('/sequence-progress', async (req, res, next) => {
+  try {
+    const items = await listSequenceProgress(requireUserId(req));
+    res.json(items);
+  } catch (err) {
+    handleWorkflowErr(err, next);
+  }
+});
+
+workflowsRouter.get('/:id/sequence-progress', async (req, res, next) => {
+  try {
+    const item = await buildSequenceProgress(requireUserId(req), asString(req.params.id, 'id'));
+    res.json(item);
+  } catch (err) {
+    handleWorkflowErr(err, next);
+  }
+});
+
 workflowsRouter.get('/mail-history', async (req, res, next) => {
   try {
     const contactId = String(req.query.contactId ?? '').trim();

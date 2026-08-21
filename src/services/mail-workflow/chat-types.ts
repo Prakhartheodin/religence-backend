@@ -21,7 +21,7 @@ export type AssistantChoice = {
 };
 
 export type AssistantConfirmAction = {
-  type: 'schedule' | 'pause' | 'resume' | 'cancel';
+  type: 'schedule' | 'update' | 'pause' | 'resume' | 'cancel';
   workflowId?: string;
   label: string;
 };

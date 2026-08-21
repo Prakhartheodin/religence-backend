@@ -229,7 +229,7 @@ async function recordDismissal(
         ? { dismissedSentAt: opts.dismissedSentAt }
         : {}),
     },
-    { upsert: true, new: true }
+    { upsert: true, returnDocument: 'after' }
   );
 }
 

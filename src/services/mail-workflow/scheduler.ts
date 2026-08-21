@@ -51,7 +51,7 @@ async function claimWorkflow(wf: MailWorkflowDocument, now: Date): Promise<MailW
         leaseUntil: new Date(now.getTime() + CLAIM_LEASE_MS),
       },
     },
-    { new: true },
+    { returnDocument: 'after' },
   ).lean();
 }
 
