@@ -13,7 +13,10 @@
     "verify:excel": "tsx scripts/verify-master-data.ts",
     "backup": "tsx scripts/backup-db.ts",
     "backup:dry": "tsx scripts/backup-db.ts --dry-run",
-    "changelog": "tsx scripts/changelog.ts"
+    "changelog": "tsx scripts/changelog.ts",
+    "check:mail": "tsx scripts/check-mail-workflow.ts",
+    "check:mail:integration": "tsx src/services/mail-workflow/integration.check.ts",
+    "verify:outlook": "tsx scripts/verify-outlook-send.ts"
   },
   "dependencies": {
     "@azure/msal-node": "^3.7.3",

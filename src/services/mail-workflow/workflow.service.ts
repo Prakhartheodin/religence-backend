@@ -15,16 +15,21 @@ import {
 import { UserModel } from '../../models/user.model.js';
 import { listEmailTemplates, type EmailTemplateRecord } from '../email-templates.service.js';
 import { findActiveOutlookAccountsByUser } from '../outlook-store.js';
+import { sendMessage } from '../outlook.service.js';
 import {
   CONTRACT_VERSION,
+  executionModeOf,
   WorkflowError,
+  type ExecutionMode,
   type RunStatus,
   type WorkflowAction,
   type WorkflowCommandContractV1,
   type WorkflowSchedule,
   type WorkflowStatus,
 } from './contract.js';
-import { computeNextRunAt } from './recurrence.js';
+import { computeNextRunAt, scheduleRunAt } from './recurrence.js';
+import { mailLog } from './log.js';
+import { scheduleImmediateWake } from './wake.js';
 import {
   applyTemplate,
   extractPlaceholders,
@@ -32,6 +37,7 @@ import {
   leadVars,
   toHtml,
 } from './render.js';
+import { classifySendError, providerIdempotencyKey } from './retry.js';
 
 const ISO_DOW = [
   'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday',
@@ -43,7 +49,7 @@ export function isDuplicateKeyError(err: unknown): boolean {
   return (err as { code?: number }).code === 11000;
 }
 
-function workflowTimezone(): string {
+export function workflowTimezone(): string {
   return process.env.WORKFLOW_TIMEZONE?.trim() || 'Asia/Kolkata';
 }
 
@@ -56,8 +62,11 @@ function formatTime12(time: string): string {
   return `${h}:${mStr} ${ampm}`;
 }
 
-export function scheduleLabel(s: WorkflowSchedule, _tz: string): string {
-  const at = formatTime12(s.time);
+export function scheduleLabel(s: WorkflowSchedule, tz: string): string {
+  if (s.frequency === 'once') {
+    return s.runAt ? singleRunLabel(s.runAt, tz) : 'Send once';
+  }
+  const at = formatTime12(s.time ?? '00:00');
   if (s.frequency === 'daily') return `Every day at ${at}`;
   if (s.frequency === 'weekly') {
     const day = ISO_DOW[(s.dayOfWeek ?? 1) - 1];
@@ -72,7 +81,22 @@ export function scheduleLabel(s: WorkflowSchedule, _tz: string): string {
   return `Every month on the ${dom}${suffix} at ${at}`;
 }
 
+function singleRunLabel(sendAtIso: string, timeZone: string): string {
+  const dt = new Date(sendAtIso);
+  if (Number.isNaN(dt.getTime())) return 'Send once';
+  try {
+    return `Send once at ${new Intl.DateTimeFormat(undefined, {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+      timeZone,
+    }).format(dt)}`;
+  } catch {
+    return `Send once at ${dt.toLocaleString()}`;
+  }
+}
+
 export function endLabel(s: WorkflowSchedule): string {
+  if (s.frequency === 'once') return 'Single send';
   if (s.endDate && s.maxRuns) return `Ends ${s.endDate} or after ${s.maxRuns} sends`;
   if (s.endDate) return `Ends ${s.endDate}`;
   if (s.maxRuns) return `Stops after ${s.maxRuns} sends`;
@@ -119,6 +143,8 @@ export type MailWorkflow = {
   userId: string;
   createdByUserId: string;
   status: WorkflowStatus;
+  executionMode: ExecutionMode;
+  oneTimeSendAt: Date | null;
   templateId: string;
   recipientIds: string[];
   recipientScope: 'crm_only';
@@ -157,7 +183,54 @@ export function variablesFromDoc(v: unknown): Record<string, string> {
   return {};
 }
 
+function effectiveExecutionMode(contract: WorkflowCommandContractV1): ExecutionMode {
+  return executionModeOf(contract.schedule);
+}
+
+function contractSchedule(contract: WorkflowCommandContractV1): WorkflowSchedule {
+  if (!contract.schedule) {
+    throw new WorkflowError('SCHEDULE_INVALID', 'schedule required');
+  }
+  return contract.schedule;
+}
+
+/** The instant a `once` schedule fires. Absent runAt means "now". */
+function onceRunAt(schedule: WorkflowSchedule): Date {
+  const at = scheduleRunAt(schedule);
+  return at ?? new Date();
+}
+
+export function isImmediateOneTime(contract: WorkflowCommandContractV1, now = new Date()): boolean {
+  if (effectiveExecutionMode(contract) !== 'once') return false;
+  return onceRunAt(contractSchedule(contract)).getTime() <= now.getTime() + 60_000;
+}
+
+/**
+ * First occurrence for a freshly activated workflow.
+ * `once` fires at its runAt (possibly already in the past, i.e. "send now").
+ */
+function firstRunAt(schedule: WorkflowSchedule, timezone: string, now = new Date()): Date | null {
+  if (schedule.frequency === 'once') return onceRunAt(schedule);
+  return computeNextRunAt(schedule, timezone, now);
+}
+
+export function renderLeadMessage(
+  template: EmailTemplateRecord,
+  lead: WorkflowLead,
+  senderName: string,
+  variables: Record<string, string>,
+): { subject: string; html: string } {
+  const vars = { ...leadVars(lead, senderName), ...variables };
+  return {
+    subject: applyTemplate(template.subject, vars),
+    html: toHtml(applyTemplate(template.body, vars)),
+  };
+}
+
 export function contractScheduleToModel(s: WorkflowSchedule): MailWorkflowSchedule {
+  if (s.frequency === 'once') {
+    return { frequency: 'once', runAt: s.runAt ? new Date(s.runAt) : null };
+  }
   return {
     frequency: s.frequency,
     timeOfDay: s.time,
@@ -169,6 +242,13 @@ export function contractScheduleToModel(s: WorkflowSchedule): MailWorkflowSchedu
 }
 
 export function modelScheduleToContract(s: MailWorkflowSchedule): WorkflowSchedule {
+  if (s.frequency === 'once') {
+    return { frequency: 'once', runAt: s.runAt ? new Date(s.runAt).toISOString() : undefined };
+  }
+  // Legacy rows stored a one-time send as daily + endDate + maxRuns:1. Read them as `once`.
+  if (s.maxRuns === 1 && s.endDate && s.frequency === 'daily' && s.timeOfDay) {
+    return { frequency: 'daily', time: s.timeOfDay, endDate: s.endDate, maxRuns: 1 };
+  }
   return {
     frequency: s.frequency,
     time: s.timeOfDay,
@@ -186,6 +266,8 @@ export function toMailWorkflow(doc: MailWorkflowDocument | Record<string, unknow
     userId: d.userId,
     createdByUserId: d.createdByUserId,
     status: d.status,
+    executionMode: d.executionMode ?? 'recurring',
+    oneTimeSendAt: d.oneTimeSendAt ?? null,
     templateId: d.templateId,
     recipientIds: d.recipientIds,
     recipientScope: d.recipientScope,
@@ -291,48 +373,59 @@ export function assertExtraVars(
 }
 
 async function validateCreateContract(userId: string, contract: WorkflowCommandContractV1): Promise<void> {
-  const { templateId, recipientIds, schedule } = contract;
-  if (!templateId || !recipientIds?.length || !schedule) {
-    throw new WorkflowError('CONTRACT_INVALID', 'templateId, recipientIds, and schedule required');
+  const { templateId, recipientIds } = contract;
+  if (!templateId || !recipientIds?.length) {
+    throw new WorkflowError('CONTRACT_INVALID', 'templateId and recipientIds are required');
+  }
+  if (effectiveExecutionMode(contract) === 'recurring' && !contract.schedule) {
+    throw new WorkflowError('CONTRACT_INVALID', 'schedule required for recurring mode');
   }
   const template = await loadTemplate(userId, templateId);
   await loadOwnedLeads(userId, recipientIds);
   assertExtraVars(template, contract.variables ?? {});
 }
 
-export async function buildPreview(
+async function buildPreviewInternal(
   userId: string,
   contract: WorkflowCommandContractV1,
+  opts: { requireAuth: boolean },
 ): Promise<PreviewSummary> {
   if (contract.action !== 'create') {
     throw new WorkflowError('CONTRACT_INVALID', 'preview only supports create');
   }
-  const { templateId, recipientIds, schedule } = contract;
-  if (!templateId || !recipientIds?.length || !schedule) {
-    throw new WorkflowError('CONTRACT_INVALID', 'templateId, recipientIds, and schedule required');
+  const { templateId, recipientIds } = contract;
+  if (!templateId || !recipientIds?.length) {
+    throw new WorkflowError('CONTRACT_INVALID', 'templateId and recipientIds are required');
   }
 
   const preflight = await inboxPreflight(userId);
-  if (!preflight.connected || !preflight.accountId) {
+  if (opts.requireAuth && (!preflight.connected || !preflight.accountId)) {
     throw new WorkflowError('AUTH_REQUIRED', 'outlook account required');
   }
 
   const [template, leads, account] = await Promise.all([
     loadTemplate(userId, templateId),
     loadOwnedLeads(userId, recipientIds),
-    findActiveOutlookAccountsByUser(userId).then((accounts) => accounts.find((a) => a.id === preflight.accountId)),
+    preflight.accountId
+      ? findActiveOutlookAccountsByUser(userId).then((accounts) =>
+          accounts.find((a) => a.id === preflight.accountId),
+        )
+      : Promise.resolve(undefined),
   ]);
   assertExtraVars(template, contract.variables ?? {});
 
   const user = await UserModel.findOne({ userId }).lean();
   const senderName = String(user?.name ?? '').trim() || 'Sender';
   const timezone = workflowTimezone();
-  const nextRunAt = computeNextRunAt(schedule, timezone, new Date());
+  const schedule = contractSchedule(contract);
+  const executionMode = effectiveExecutionMode(contract);
+  const nextRunAt = firstRunAt(schedule, timezone);
+  if (!nextRunAt) {
+    throw new WorkflowError('SCHEDULE_INVALID', 'that schedule has no upcoming send');
+  }
 
   const first = leads[0];
-  const vars = { ...leadVars(first, senderName), ...(contract.variables ?? {}) };
-  const subjectPreview = applyTemplate(template.subject, vars);
-  const bodyPreviewHtml = toHtml(applyTemplate(template.body, vars));
+  const rendered = renderLeadMessage(template, first, senderName, contract.variables ?? {});
 
   return {
     kind: 'preview_summary',
@@ -347,12 +440,27 @@ export async function buildPreview(
     timezone,
     endLabel: endLabel(schedule),
     mailbox: account?.email ?? '',
-    accountId: preflight.accountId,
+    accountId: preflight.accountId ?? '',
     nextSendAt: nextRunAt.toISOString(),
-    subjectPreview,
-    bodyPreviewHtml,
+    subjectPreview: rendered.subject,
+    bodyPreviewHtml: rendered.html,
     contract,
   };
+}
+
+export async function buildPreview(
+  userId: string,
+  contract: WorkflowCommandContractV1,
+): Promise<PreviewSummary> {
+  return buildPreviewInternal(userId, contract, { requireAuth: true });
+}
+
+/** Preview without requiring a connected inbox (mailbox left empty). */
+export async function buildDraftPreview(
+  userId: string,
+  contract: WorkflowCommandContractV1,
+): Promise<PreviewSummary> {
+  return buildPreviewInternal(userId, contract, { requireAuth: false });
 }
 
 export async function createWorkflow(
@@ -365,7 +473,8 @@ export async function createWorkflow(
   }
   await validateCreateContract(userId, contract);
 
-  const { templateId, recipientIds, schedule } = contract;
+  const { templateId, recipientIds } = contract;
+  const executionMode = effectiveExecutionMode(contract);
   const preflight = await inboxPreflight(userId);
 
   if (preflight.sendAllowed && !opts.confirmed) {
@@ -380,15 +489,19 @@ export async function createWorkflow(
     async () => {
       const timezone = workflowTimezone();
       const variables = contract.variables ?? {};
-      const scheduleDoc = contractScheduleToModel(schedule!);
+      const schedule = contractSchedule(contract);
+      const scheduleDoc = contractScheduleToModel(schedule);
+      const oneTimeSendAt = executionMode === 'once' ? onceRunAt(schedule) : null;
 
       if (preflight.sendAllowed && opts.confirmed) {
-        const nextRunAt = computeNextRunAt(schedule!, timezone, new Date());
+        const nextRunAt = firstRunAt(schedule, timezone);
         const doc = await MailWorkflowModel.create({
           id: randomUUID(),
           userId,
           createdByUserId: userId,
           status: 'active',
+          executionMode,
+          oneTimeSendAt,
           templateId: templateId!,
           recipientIds: recipientIds!,
           recipientScope: 'crm_only',
@@ -403,6 +516,17 @@ export async function createWorkflow(
           leaseUntil: null,
           lockId: null,
         });
+        mailLog.info('workflow.created', {
+          workspaceId: userId,
+          userId,
+          workflowId: doc.id,
+          requestId: contract.requestId,
+          frequency: schedule.frequency,
+          recipients: recipientIds!.length,
+        });
+        // "Send now" still goes through the one durable send path; we just wake the
+        // executor immediately instead of waiting for the next 30s tick.
+        if (isImmediateOneTime(contract)) scheduleImmediateWake();
         return toMailWorkflow(doc.toObject()) as MailWorkflow & Record<string, unknown>;
       }
 
@@ -411,6 +535,8 @@ export async function createWorkflow(
         userId,
         createdByUserId: userId,
         status: 'draft_requires_auth',
+        executionMode,
+        oneTimeSendAt,
         templateId: templateId!,
         recipientIds: recipientIds!,
         recipientScope: 'crm_only',
@@ -443,22 +569,60 @@ export async function confirmWorkflow(
     async () => {
       const wf = await MailWorkflowModel.findOne({ userId, id: workflowId });
       if (!wf) throw new WorkflowError('WORKFLOW_NOT_FOUND', 'workflow not found');
-      if (wf.status !== 'pending_confirm') {
-        throw new WorkflowError('CONTRACT_INVALID', 'workflow not pending confirm');
+      // Already active: confirming twice is a no-op, not an error (double-click / retry).
+      if (wf.status === 'active') {
+        return toMailWorkflow(wf.toObject()) as MailWorkflow & Record<string, unknown>;
+      }
+      if (wf.status !== 'pending_confirm' && wf.status !== 'paused_auth_required') {
+        throw new WorkflowError('CONTRACT_INVALID', 'this scheduled email is not awaiting confirmation');
       }
 
       const preflight = await inboxPreflight(userId);
       if (!preflight.sendAllowed || !preflight.accountId) {
-        throw new WorkflowError('AUTH_REQUIRED', 'outlook account required');
+        throw new WorkflowError('AUTH_REQUIRED', 'Connect your Outlook account to continue.', 409);
+      }
+
+      const schedule = modelScheduleToContract(wf.schedule);
+      const nextRunAt = firstRunAt(schedule, wf.timezone);
+      if (!nextRunAt) {
+        throw new WorkflowError(
+          'SCHEDULE_INVALID',
+          'That send time has already passed. Tell me a new time and I will reschedule it.',
+        );
       }
 
       wf.status = 'active';
       wf.accountId = preflight.accountId;
-      wf.nextRunAt = computeNextRunAt(modelScheduleToContract(wf.schedule), wf.timezone, new Date());
+      wf.nextRunAt = nextRunAt;
       await wf.save();
+      mailLog.info('workflow.confirmed', {
+        workspaceId: userId, userId, workflowId, requestId, nextRunAt,
+      });
+      if (nextRunAt.getTime() <= Date.now() + 60_000) scheduleImmediateWake();
       return toMailWorkflow(wf.toObject()) as MailWorkflow & Record<string, unknown>;
     },
   );
+}
+
+/**
+ * A conditional update that matched nothing means either the workflow is gone or it
+ * changed state underneath us (a concurrent cancel, for example). Re-read so the caller
+ * gets a truthful reason rather than a generic failure.
+ */
+async function explainFailedTransition(
+  userId: string,
+  workflowId: string,
+  action: 'pause' | 'resume' | 'cancel',
+): Promise<WorkflowError> {
+  const current = await MailWorkflowModel.findOne({ userId, id: workflowId }).lean();
+  if (!current) return new WorkflowError('WORKFLOW_NOT_FOUND', 'workflow not found');
+  if (action === 'cancel') {
+    return new WorkflowError('CONTRACT_INVALID', 'workflow already terminal');
+  }
+  if (action === 'pause') {
+    return new WorkflowError('CONTRACT_INVALID', 'workflow not active');
+  }
+  return new WorkflowError('CONTRACT_INVALID', 'workflow not paused');
 }
 
 export async function pauseWorkflow(
@@ -467,15 +631,17 @@ export async function pauseWorkflow(
   requestId: string,
 ): Promise<MailWorkflow> {
   return withIdempotency(userId, requestId, 'pause', { workflowId }, async () => {
-    const wf = await MailWorkflowModel.findOne({ userId, id: workflowId });
-    if (!wf) throw new WorkflowError('WORKFLOW_NOT_FOUND', 'workflow not found');
-    if (wf.status !== 'active') {
-      throw new WorkflowError('CONTRACT_INVALID', 'workflow not active');
+    // Conditional on status: a concurrent cancel must not be silently overwritten.
+    const wf = await MailWorkflowModel.findOneAndUpdate(
+      { userId, id: workflowId, status: 'active' },
+      { $set: { status: 'paused', leaseOwner: null, leaseUntil: null, lockId: null } },
+      { new: true },
+    ).lean();
+    if (wf) {
+      mailLog.info('workflow.paused', { workspaceId: userId, userId, workflowId, requestId });
+      return toMailWorkflow(wf) as MailWorkflow & Record<string, unknown>;
     }
-    wf.status = 'paused';
-    clearLease(wf);
-    await wf.save();
-    return toMailWorkflow(wf.toObject()) as MailWorkflow & Record<string, unknown>;
+    throw await explainFailedTransition(userId, workflowId, 'pause');
   });
 }
 
@@ -485,15 +651,38 @@ export async function resumeWorkflow(
   requestId: string,
 ): Promise<MailWorkflow> {
   return withIdempotency(userId, requestId, 'resume', { workflowId }, async () => {
-    const wf = await MailWorkflowModel.findOne({ userId, id: workflowId });
-    if (!wf) throw new WorkflowError('WORKFLOW_NOT_FOUND', 'workflow not found');
-    if (wf.status !== 'paused') {
+    const current = await MailWorkflowModel.findOne({ userId, id: workflowId }).lean();
+    if (!current) throw new WorkflowError('WORKFLOW_NOT_FOUND', 'workflow not found');
+    if (current.status === 'paused_auth_required') {
+      throw new WorkflowError(
+        'AUTH_REQUIRED',
+        'Reconnect your Outlook account first, then confirm this scheduled email again.',
+        409,
+      );
+    }
+    if (current.status !== 'paused') {
       throw new WorkflowError('CONTRACT_INVALID', 'workflow not paused');
     }
-    wf.status = 'active';
-    wf.nextRunAt = computeNextRunAt(modelScheduleToContract(wf.schedule), wf.timezone, new Date());
-    await wf.save();
-    return toMailWorkflow(wf.toObject()) as MailWorkflow & Record<string, unknown>;
+    const resumeAt = computeNextRunAt(
+      modelScheduleToContract(current.schedule),
+      current.timezone,
+      new Date(),
+    );
+    if (!resumeAt) {
+      // A one-time send whose moment has passed cannot simply be un-paused.
+      throw new WorkflowError(
+        'SCHEDULE_INVALID',
+        'That send time has already passed, so there is nothing left to resume. Tell me a new time and I will set it up again.',
+      );
+    }
+    const wf = await MailWorkflowModel.findOneAndUpdate(
+      { userId, id: workflowId, status: 'paused' },
+      { $set: { status: 'active', nextRunAt: resumeAt } },
+      { new: true },
+    ).lean();
+    if (!wf) throw await explainFailedTransition(userId, workflowId, 'resume');
+    mailLog.info('workflow.resumed', { workspaceId: userId, userId, workflowId, requestId });
+    return toMailWorkflow(wf) as MailWorkflow & Record<string, unknown>;
   });
 }
 
@@ -503,16 +692,22 @@ export async function cancelWorkflow(
   requestId: string,
 ): Promise<MailWorkflow> {
   return withIdempotency(userId, requestId, 'cancel', { workflowId }, async () => {
-    const wf = await MailWorkflowModel.findOne({ userId, id: workflowId });
-    if (!wf) throw new WorkflowError('WORKFLOW_NOT_FOUND', 'workflow not found');
-    if (TERMINAL_STATUSES.has(wf.status)) {
-      throw new WorkflowError('CONTRACT_INVALID', 'workflow already terminal');
-    }
-    wf.status = 'cancelled';
-    wf.nextRunAt = null;
-    clearLease(wf);
-    await wf.save();
-    return toMailWorkflow(wf.toObject()) as MailWorkflow & Record<string, unknown>;
+    const wf = await MailWorkflowModel.findOneAndUpdate(
+      { userId, id: workflowId, status: { $nin: [...TERMINAL_STATUSES] } },
+      {
+        $set: {
+          status: 'cancelled',
+          nextRunAt: null,
+          leaseOwner: null,
+          leaseUntil: null,
+          lockId: null,
+        },
+      },
+      { new: true },
+    ).lean();
+    if (!wf) throw await explainFailedTransition(userId, workflowId, 'cancel');
+    mailLog.info('workflow.cancelled', { workspaceId: userId, userId, workflowId, requestId });
+    return toMailWorkflow(wf) as MailWorkflow & Record<string, unknown>;
   });
 }
 
@@ -549,11 +744,7 @@ export async function updateWorkflow(
       assertExtraVars(template, variablesFromDoc(wf.variables));
 
       if (wf.status === 'active' && contract.schedule) {
-        wf.nextRunAt = computeNextRunAt(
-          modelScheduleToContract(wf.schedule),
-          wf.timezone,
-          new Date(),
-        );
+        wf.nextRunAt = firstRunAt(modelScheduleToContract(wf.schedule), wf.timezone);
       }
 
       await wf.save();
@@ -597,17 +788,35 @@ export async function listExecutions(
   return MailWorkflowRunModel.find(filter).sort({ scheduledAt: -1 }).lean();
 }
 
+/**
+ * After a reconnect, move anything blocked on auth into `pending_confirm`.
+ * Deliberately does NOT reactivate: the user must confirm each one explicitly
+ * (see confirmWorkflow) so nothing starts sending behind their back.
+ */
 export async function promoteDraftsAfterReconnect(userId: string): Promise<MailWorkflow[]> {
   const preflight = await inboxPreflight(userId);
   if (!preflight.sendAllowed) return [];
 
   await MailWorkflowModel.updateMany(
-    { userId, status: 'draft_requires_auth' },
-    { $set: { status: 'pending_confirm' } },
+    { userId, status: { $in: ['draft_requires_auth', 'paused_auth_required'] } },
+    { $set: { status: 'pending_confirm', nextRunAt: null } },
   );
 
   const docs = await MailWorkflowModel.find({ userId, status: 'pending_confirm' }).lean();
+  mailLog.info('workflow.promoted_after_reconnect', {
+    workspaceId: userId,
+    userId,
+    count: docs.length,
+  });
   return docs.map((doc) => toMailWorkflow(doc));
+}
+
+/** Runs whose provider outcome could not be determined - surfaced for operator recovery. */
+export async function listRunsNeedingReview(userId: string): Promise<MailWorkflowRunDocument[]> {
+  return MailWorkflowRunModel.find({ userId, needsOperatorReview: true })
+    .sort({ scheduledAt: -1 })
+    .limit(100)
+    .lean();
 }
 
 if (process.argv[1]?.endsWith('workflow.service.ts')) {
@@ -629,6 +838,32 @@ if (process.argv[1]?.endsWith('workflow.service.ts')) {
     ['status'],
   );
   assert.deepEqual(missingExtraVars('Hi', 'Body', { status: '  ' }), []);
+  const onceContract: WorkflowCommandContractV1 = {
+    version: 'v1',
+    action: 'create',
+    executionMode: 'once',
+    schedule: { frequency: 'once', runAt: '2026-12-31T10:00:00.000Z' },
+    templateId: 't1',
+    recipientIds: ['r1'],
+    confidence: 1,
+    requestId: 'x',
+  };
+  // `once` is a real frequency now - no maxRuns=1 stand-in anywhere in the pipeline
+  assert.equal(contractScheduleToModel(onceContract.schedule!).frequency, 'once');
+  assert.equal(contractScheduleToModel(onceContract.schedule!).maxRuns, undefined);
+  assert.equal(isImmediateOneTime(onceContract), false, 'a future one-time send is not immediate');
+  assert.equal(
+    isImmediateOneTime({ ...onceContract, schedule: { frequency: 'once', runAt: new Date().toISOString() } }),
+    true,
+  );
+  assert.equal(endLabel({ frequency: 'once', runAt: '2026-12-31T10:00:00.000Z' }), 'Single send');
+  assert.match(scheduleLabel({ frequency: 'once', runAt: '2026-12-31T10:00:00.000Z' }, 'UTC'), /Send once/);
+
+  // legacy daily+maxRuns:1 rows still read back without crashing
+  assert.equal(
+    modelScheduleToContract({ frequency: 'daily', timeOfDay: '10:00', endDate: '2026-12-31', maxRuns: 1 }).maxRuns,
+    1,
+  );
 
   assert.equal(isDuplicateKeyError({ code: 11000 }), true);
   assert.equal(isDuplicateKeyError({ code: 11001 }), false);

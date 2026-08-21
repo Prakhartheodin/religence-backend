@@ -4,374 +4,310 @@ import os from 'node:os';
 import {
   MailWorkflowModel,
   type MailWorkflowDocument,
-  type MailWorkflowSchedule,
 } from '../../models/mail-workflow.model.js';
+import { MailWorkflowRunModel } from '../../models/mail-workflow-run.model.js';
+import { type RunStatus } from './contract.js';
+import { mailLog } from './log.js';
+import { computeNextRunAt, planCatchUp, type CatchUpPlan } from './recurrence.js';
+import { providerIdempotencyKey } from './retry.js';
+import { newRunRecipients, runExecutorPass } from './send-executor.js';
 import {
-  MailWorkflowRunModel,
-  type MailWorkflowRunDocument,
-} from '../../models/mail-workflow-run.model.js';
-import { UserModel } from '../../models/user.model.js';
-import { listEmailTemplates } from '../email-templates.service.js';
-import { sendMessage } from '../outlook.service.js';
-import { WorkflowError, type RunStatus } from './contract.js';
-import { computeNextRunAt, endDateReached } from './recurrence.js';
-import { applyTemplate, leadVars, toHtml } from './render.js';
-import { backoffMs, classifySendError, providerIdempotencyKey } from './retry.js';
-import {
-  inboxPreflight,
   isDuplicateKeyError,
   loadOwnedLeads,
   modelScheduleToContract,
-  variablesFromDoc,
 } from './workflow.service.js';
 
-const LEASE_MS = 10 * 60 * 1000;
+const CLAIM_LEASE_MS = 60 * 1000;
 const BATCH_SIZE = 20;
-const MAX_SEND_ATTEMPTS = 3;
 
 let ticking = false;
 
-type GateWorkflow = {
-  status: MailWorkflowDocument['status'];
-  nextRunAt: Date | null;
-  runCount: number;
-  schedule: MailWorkflowSchedule;
-  timezone: string;
-};
-
 export function terminalRunStatus(status: RunStatus): boolean {
-  return status === 'success' || status === 'failed' || status === 'skipped';
+  return status !== 'running';
 }
 
-export function shouldCompleteBeforeClaim(wf: GateWorkflow, now: Date): boolean {
-  if (wf.status !== 'active' || !wf.nextRunAt || wf.nextRunAt > now) return false;
-  const schedule = modelScheduleToContract(wf.schedule);
-  if (schedule.maxRuns != null && wf.runCount >= schedule.maxRuns) return true;
-  return endDateReached(schedule, wf.timezone, wf.nextRunAt);
+function leaseOwnerId(): string {
+  return `${os.hostname()}:${process.pid}`;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function workflowCompleteAfterRun(
-  schedule: ReturnType<typeof modelScheduleToContract>,
-  timezone: string,
-  scheduledAt: Date,
-  newRunCount: number,
-): boolean {
-  if (schedule.maxRuns != null && newRunCount >= schedule.maxRuns) return true;
-  const next = computeNextRunAt(schedule, timezone, scheduledAt, { afterOccurrence: scheduledAt });
-  return endDateReached(schedule, timezone, next);
-}
-
-async function releaseLease(workflowId: string, lockId: string): Promise<boolean> {
-  const doc = await MailWorkflowModel.findOneAndUpdate(
-    { id: workflowId, lockId },
-    { $set: { leaseOwner: null, leaseUntil: null, lockId: null } },
-  );
-  return doc != null;
-}
-
-async function extendLease(workflowId: string, lockId: string, now: Date): Promise<boolean> {
-  const doc = await MailWorkflowModel.findOneAndUpdate(
-    { id: workflowId, lockId },
-    { $set: { leaseUntil: new Date(now.getTime() + LEASE_MS) } },
-  );
-  return doc != null;
-}
-
-async function advanceAndRelease(
-  wf: MailWorkflowDocument,
-  lockId: string,
-  scheduledAt: Date,
-  now: Date,
-  opts: { runCountDelta?: number; failureCountDelta?: number; lastRunAt?: boolean } = {},
-): Promise<boolean> {
-  const schedule = modelScheduleToContract(wf.schedule);
-  const newRunCount = wf.runCount + (opts.runCountDelta ?? 0);
-  const complete = workflowCompleteAfterRun(schedule, wf.timezone, scheduledAt, newRunCount);
-  const update: Record<string, unknown> = {
-    status: complete ? 'completed' : 'active',
-    nextRunAt: complete
-      ? null
-      : computeNextRunAt(schedule, wf.timezone, scheduledAt, { afterOccurrence: scheduledAt }),
-    leaseOwner: null,
-    leaseUntil: null,
-    lockId: null,
-  };
-  if (opts.runCountDelta) update.runCount = newRunCount;
-  if (opts.failureCountDelta) update.failureCount = wf.failureCount + opts.failureCountDelta;
-  if (opts.lastRunAt) update.lastRunAt = now;
-
-  const doc = await MailWorkflowModel.findOneAndUpdate({ id: wf.id, lockId }, { $set: update });
-  return doc != null;
-}
-
-async function claimLease(wf: MailWorkflowDocument, now: Date): Promise<MailWorkflowDocument | null> {
+/**
+ * Claim a workflow just long enough to create its occurrence row and advance nextRunAt.
+ * The lease is short because no sending happens under it — that is the executor's job.
+ */
+async function claimWorkflow(wf: MailWorkflowDocument, now: Date): Promise<MailWorkflowDocument | null> {
   const lockId = randomUUID();
-  const leaseOwner = `${os.hostname()}:${process.pid}`;
-  const leaseUntil = new Date(now.getTime() + LEASE_MS);
-  const doc = await MailWorkflowModel.findOneAndUpdate(
+  return MailWorkflowModel.findOneAndUpdate(
     {
       id: wf.id,
       userId: wf.userId,
       status: 'active',
+      nextRunAt: { $lte: now },
       $or: [{ leaseUntil: null }, { leaseUntil: { $lte: now } }],
     },
-    { $set: { leaseOwner, lockId, leaseUntil } },
-    { new: true },
-  ).lean();
-  return doc;
-}
-
-async function recordAttempt(runId: string, classified: ReturnType<typeof classifySendError>): Promise<void> {
-  await MailWorkflowRunModel.updateOne(
-    { id: runId },
-    {
-      $push: {
-        attempts: {
-          at: new Date(),
-          errorCode: classified.code,
-          errorMessage: classified.message,
-          retriable: classified.retriable,
-        },
-      },
-      $inc: { attemptCount: 1 },
-    },
-  );
-}
-
-async function failAuthAndPause(
-  wf: MailWorkflowDocument,
-  lockId: string,
-  runId: string,
-): Promise<void> {
-  await MailWorkflowRunModel.updateOne(
-    { id: runId },
-    { $set: { status: 'failed', failureReason: 'AUTH_REQUIRED' } },
-  );
-  await MailWorkflowModel.findOneAndUpdate(
-    { id: wf.id, lockId },
     {
       $set: {
-        status: 'draft_requires_auth',
-        leaseOwner: null,
-        leaseUntil: null,
-        lockId: null,
+        leaseOwner: leaseOwnerId(),
+        lockId,
+        leaseUntil: new Date(now.getTime() + CLAIM_LEASE_MS),
       },
     },
+    { new: true },
+  ).lean();
+}
+
+async function releaseWorkflow(
+  workflowId: string,
+  lockId: string,
+  update: Record<string, unknown> = {},
+): Promise<void> {
+  await MailWorkflowModel.updateOne(
+    { id: workflowId, lockId },
+    { $set: { ...update, leaseOwner: null, leaseUntil: null, lockId: null } },
   );
 }
 
-async function executeOccurrence(wf: MailWorkflowDocument, lockId: string, now: Date): Promise<void> {
-  const scheduledAt = wf.nextRunAt;
-  if (!scheduledAt) {
-    await releaseLease(wf.id, lockId);
-    return;
-  }
-
-  const idemKey = providerIdempotencyKey(wf.userId, wf.id, scheduledAt);
-  let run: MailWorkflowRunDocument;
-
+/** Record that occurrences were skipped, so the gap is visible in run history. */
+async function recordSkippedOccurrence(
+  wf: MailWorkflowDocument,
+  occurrence: Date,
+  skipped: number,
+): Promise<void> {
   try {
-    const created = await MailWorkflowRunModel.create({
+    await MailWorkflowRunModel.create({
       id: randomUUID(),
       workflowId: wf.id,
       userId: wf.userId,
-      scheduledAt,
-      status: 'running',
+      scheduledAt: occurrence,
+      status: 'skipped',
+      sendState: 'failed',
       attemptCount: 0,
       attempts: [],
-      providerIdempotencyKey: idemKey,
+      recipients: [],
+      providerIdempotencyKey: providerIdempotencyKey(wf.userId, wf.id, occurrence),
+      skipReason:
+        skipped > 1
+          ? `STALE_OCCURRENCE (${skipped} missed while the scheduler was unavailable)`
+          : 'STALE_OCCURRENCE',
     });
-    run = created.toObject() as MailWorkflowRunDocument;
   } catch (err) {
     if (!isDuplicateKeyError(err)) throw err;
-    const existing = await MailWorkflowRunModel.findOne({ workflowId: wf.id, scheduledAt }).lean();
-    if (!existing) throw err;
-    if (terminalRunStatus(existing.status)) {
-      await advanceAndRelease(wf, lockId, scheduledAt, now);
-      return;
-    }
-    run = existing;
   }
-
-  const fresh = await MailWorkflowModel.findOne({ id: wf.id, lockId }).lean();
-  if (!fresh || fresh.status !== 'active') {
-    await MailWorkflowRunModel.updateOne(
-      { id: run.id },
-      { $set: { status: 'skipped', skipReason: fresh?.status ?? 'unknown' } },
-    );
-    await releaseLease(wf.id, lockId);
-    return;
-  }
-  wf = fresh;
-
-  const preflight = await inboxPreflight(wf.userId);
-  if (!preflight.sendAllowed || !preflight.accountId) {
-    await failAuthAndPause(wf, lockId, run.id);
-    return;
-  }
-
-  let leads;
-  try {
-    leads = await loadOwnedLeads(wf.userId, wf.recipientIds);
-  } catch (err) {
-    if (err instanceof WorkflowError && err.code === 'RECIPIENT_NOT_FOUND') {
-      await MailWorkflowRunModel.updateOne(
-        { id: run.id },
-        { $set: { status: 'skipped', skipReason: 'RECIPIENT_NOT_FOUND' } },
-      );
-      await advanceAndRelease(wf, lockId, scheduledAt, now, { runCountDelta: 1, lastRunAt: true });
-      return;
-    }
-    throw err;
-  }
-
-  const templates = await listEmailTemplates(wf.userId);
-  const template = templates.find((t) => t.id === wf.templateId);
-  if (!template) {
-    await MailWorkflowRunModel.updateOne(
-      { id: run.id },
-      { $set: { status: 'failed', failureReason: 'TEMPLATE_MISSING' } },
-    );
-    await advanceAndRelease(wf, lockId, scheduledAt, now, {
-      runCountDelta: 1,
-      failureCountDelta: 1,
-      lastRunAt: true,
-    });
-    return;
-  }
-
-  const user = await UserModel.findOne({ userId: wf.userId }).lean();
-  const senderName = String(user?.name ?? '').trim() || 'Sender';
-  const variables = variablesFromDoc(wf.variables);
-  const accountId = wf.accountId || preflight.accountId;
-
-  let sentCount = 0;
-  for (const lead of leads) {
-    const vars = { ...leadVars(lead, senderName), ...variables };
-    const subject = applyTemplate(template.subject, vars);
-    const html = toHtml(applyTemplate(template.body, vars));
-    const leadIdemKey = `${idemKey}:${lead.id}`;
-    let sent = false;
-
-    for (let attempt = 0; attempt < MAX_SEND_ATTEMPTS; attempt++) {
-      try {
-        await sendMessage(wf.userId, accountId, {
-          to: lead.contactEmail,
-          subject,
-          html,
-          idempotencyKey: leadIdemKey,
-        });
-        sent = true;
-        sentCount++;
-        break;
-      } catch (err) {
-        const classified = classifySendError(err);
-        await recordAttempt(run.id, classified);
-        if (!classified.retriable) {
-          if (classified.code === 'AUTH_REQUIRED') {
-            await failAuthAndPause(wf, lockId, run.id);
-            return;
-          }
-          break;
-        }
-        if (attempt < MAX_SEND_ATTEMPTS - 1) {
-          if (!(await extendLease(wf.id, lockId, new Date()))) return;
-          await sleep(backoffMs(attempt));
-        }
-      }
-    }
-  }
-
-  if (sentCount === 0) {
-    await MailWorkflowRunModel.updateOne(
-      { id: run.id },
-      { $set: { status: 'failed', failureReason: 'SEND_FAILED' } },
-    );
-    await advanceAndRelease(wf, lockId, scheduledAt, now, {
-      runCountDelta: 1,
-      failureCountDelta: 1,
-      lastRunAt: true,
-    });
-    return;
-  }
-
-  await MailWorkflowRunModel.updateOne({ id: run.id }, { $set: { status: 'success' } });
-  await advanceAndRelease(wf, lockId, scheduledAt, now, { runCountDelta: 1, lastRunAt: true });
 }
 
+/**
+ * Create the run row for one occurrence. Unique (workflowId, scheduledAt) makes this
+ * safe under concurrent ticks — a duplicate simply means another worker got there first.
+ */
+async function createOccurrenceRun(
+  wf: MailWorkflowDocument,
+  occurrence: Date,
+): Promise<boolean> {
+  let recipients: ReturnType<typeof newRunRecipients> = [];
+  try {
+    const leads = await loadOwnedLeads(wf.userId, wf.recipientIds);
+    recipients = newRunRecipients(leads);
+  } catch {
+    // Leave recipients empty; the executor records RECIPIENT_NOT_FOUND and skips the run.
+    recipients = [];
+  }
+
+  try {
+    await MailWorkflowRunModel.create({
+      id: randomUUID(),
+      workflowId: wf.id,
+      userId: wf.userId,
+      scheduledAt: occurrence,
+      status: 'running',
+      sendState: 'scheduled',
+      attemptCount: 0,
+      attempts: [],
+      recipients,
+      providerIdempotencyKey: providerIdempotencyKey(wf.userId, wf.id, occurrence),
+      nextAttemptAt: null,
+    });
+    return true;
+  } catch (err) {
+    if (isDuplicateKeyError(err)) return false;
+    throw err;
+  }
+}
+
+export function planForWorkflow(wf: MailWorkflowDocument, now: Date): CatchUpPlan {
+  return planCatchUp(modelScheduleToContract(wf.schedule), wf.timezone, wf.nextRunAt, now);
+}
+
+/** True when the workflow has hit its own stop condition regardless of the clock. */
+export function exhaustedByLimits(wf: MailWorkflowDocument): boolean {
+  const schedule = modelScheduleToContract(wf.schedule);
+  if (schedule.maxRuns != null && wf.runCount >= schedule.maxRuns) return true;
+  return false;
+}
+
+async function processDueWorkflow(wf: MailWorkflowDocument, now: Date): Promise<void> {
+  const claimed = await claimWorkflow(wf, now);
+  if (!claimed?.lockId) return;
+  const lockId = claimed.lockId;
+  const ctx = {
+    workspaceId: claimed.userId,
+    userId: claimed.userId,
+    workflowId: claimed.id,
+  };
+
+  try {
+    if (exhaustedByLimits(claimed)) {
+      await releaseWorkflow(claimed.id, lockId, { status: 'completed', nextRunAt: null });
+      mailLog.info('workflow.completed_max_runs', ctx);
+      return;
+    }
+
+    const plan = planForWorkflow(claimed, now);
+
+    if (plan.action === 'wait') {
+      await releaseWorkflow(claimed.id, lockId);
+      return;
+    }
+
+    if (plan.action === 'complete') {
+      await releaseWorkflow(claimed.id, lockId, { status: 'completed', nextRunAt: null });
+      mailLog.info('workflow.completed', ctx);
+      return;
+    }
+
+    if (plan.action === 'skip') {
+      await recordSkippedOccurrence(claimed, plan.lastSkipped, plan.skipped);
+      mailLog.warn('scheduler.stale_occurrences_skipped', {
+        ...ctx,
+        skipped: plan.skipped,
+        lastSkipped: plan.lastSkipped,
+      });
+
+      if (plan.runNow) {
+        const created = await createOccurrenceRun(claimed, plan.runNow);
+        const next = computeNextRunAt(
+          modelScheduleToContract(claimed.schedule),
+          claimed.timezone,
+          now,
+          { afterOccurrence: plan.runNow },
+        );
+        await releaseWorkflow(claimed.id, lockId, { nextRunAt: next });
+        if (created) mailLog.info('scheduler.occurrence_claimed', { ...ctx, occurrence: plan.runNow });
+        return;
+      }
+
+      await releaseWorkflow(claimed.id, lockId, {
+        nextRunAt: plan.nextRunAt,
+        ...(plan.nextRunAt ? {} : { status: 'completed' }),
+      });
+      return;
+    }
+
+    // plan.action === 'run'
+    const created = await createOccurrenceRun(claimed, plan.occurrence);
+    const next = computeNextRunAt(
+      modelScheduleToContract(claimed.schedule),
+      claimed.timezone,
+      now,
+      { afterOccurrence: plan.occurrence },
+    );
+    await releaseWorkflow(claimed.id, lockId, { nextRunAt: next });
+    if (created) {
+      mailLog.info('scheduler.occurrence_claimed', { ...ctx, occurrence: plan.occurrence });
+    }
+  } catch (err) {
+    await releaseWorkflow(claimed.id, lockId);
+    throw err;
+  }
+}
+
+/**
+ * One scheduler tick: claim due occurrences (fast, never sends), then run an executor
+ * pass (sends, but never sleeps). Both halves are bounded so the loop stays responsive.
+ */
 export async function runSchedulerTick(now = new Date()): Promise<void> {
   if (ticking) return;
   ticking = true;
   try {
     const due = await MailWorkflowModel.find({
       status: 'active',
-      nextRunAt: { $lte: now },
-    }).lean();
-
-    for (const wf of due) {
-      if (shouldCompleteBeforeClaim(wf, now)) {
-        await MailWorkflowModel.updateOne(
-          { id: wf.id, status: 'active' },
-          { $set: { status: 'completed', nextRunAt: null } },
-        );
-      }
-    }
-
-    const batch = await MailWorkflowModel.find({
-      status: 'active',
-      nextRunAt: { $lte: now },
+      nextRunAt: { $ne: null, $lte: now },
     })
       .limit(BATCH_SIZE)
       .lean();
 
-    for (const wf of batch) {
-      const claimed = await claimLease(wf, now);
-      if (!claimed?.lockId) continue;
-      await executeOccurrence(claimed, claimed.lockId, now);
+    for (const wf of due) {
+      try {
+        await processDueWorkflow(wf, now);
+      } catch (err) {
+        mailLog.error('scheduler.claim_failed', {
+          workspaceId: wf.userId,
+          userId: wf.userId,
+          workflowId: wf.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
+
+    await runExecutorPass(now);
   } finally {
     ticking = false;
   }
 }
 
 if (process.argv[1]?.endsWith('scheduler.ts')) {
-  const now = new Date('2026-08-25T04:30:00.000Z');
+  const now = new Date('2026-08-25T05:00:00.000Z'); // 10:30 IST
   const base = {
+    id: 'wf-1',
+    userId: 'u1',
     status: 'active' as const,
+    executionMode: 'recurring' as const,
     nextRunAt: new Date('2026-08-25T04:30:00.000Z'),
     runCount: 0,
     timezone: 'Asia/Kolkata',
     schedule: { frequency: 'daily' as const, timeOfDay: '10:00' },
-  };
+  } as unknown as MailWorkflowDocument;
 
-  assert.equal(shouldCompleteBeforeClaim(base, now), false);
+  assert.equal(planForWorkflow(base, now).action, 'run');
+
+  // not due yet
   assert.equal(
-    shouldCompleteBeforeClaim(
-      { ...base, schedule: { ...base.schedule, endDate: '2026-08-24' } },
-      now,
-    ),
+    planForWorkflow({ ...base, nextRunAt: new Date('2026-08-26T04:30:00Z') } as MailWorkflowDocument, now).action,
+    'wait',
+  );
+
+  // 3-day outage must not produce 3 sends
+  const storm = planForWorkflow(
+    { ...base, nextRunAt: new Date('2026-08-22T04:30:00Z') } as MailWorkflowDocument,
+    now,
+  );
+  assert.equal(storm.action, 'skip');
+  if (storm.action === 'skip') {
+    assert.equal(storm.skipped, 3);
+    assert.equal(storm.runNow?.toISOString(), '2026-08-25T04:30:00.000Z');
+  }
+
+  // maxRuns is enforced before anything is claimed
+  assert.equal(
+    exhaustedByLimits({
+      ...base,
+      runCount: 3,
+      schedule: { frequency: 'daily', timeOfDay: '10:00', maxRuns: 3 },
+    } as unknown as MailWorkflowDocument),
     true,
   );
-  assert.equal(
-    shouldCompleteBeforeClaim(
-      { ...base, schedule: { ...base.schedule, maxRuns: 3 }, runCount: 3 },
-      now,
-    ),
-    true,
-  );
-  assert.equal(shouldCompleteBeforeClaim({ ...base, status: 'paused' }, now), false);
-  assert.equal(
-    shouldCompleteBeforeClaim({ ...base, nextRunAt: new Date('2026-08-26T04:30:00.000Z') }, now),
-    false,
-  );
+  assert.equal(exhaustedByLimits(base), false);
+
+  // once-schedule shape flows through the planner
+  const onceWf = {
+    ...base,
+    executionMode: 'once' as const,
+    nextRunAt: new Date('2026-08-25T04:45:00Z'),
+    schedule: { frequency: 'once' as const, runAt: new Date('2026-08-25T04:45:00Z') },
+  } as unknown as MailWorkflowDocument;
+  assert.equal(planForWorkflow(onceWf, now).action, 'run');
 
   assert.equal(terminalRunStatus('success'), true);
-  assert.equal(terminalRunStatus('failed'), true);
-  assert.equal(terminalRunStatus('skipped'), true);
+  assert.equal(terminalRunStatus('partial_success'), true);
+  assert.equal(terminalRunStatus('unknown'), true);
   assert.equal(terminalRunStatus('running'), false);
 
   assert.equal(isDuplicateKeyError({ code: 11000 }), true);

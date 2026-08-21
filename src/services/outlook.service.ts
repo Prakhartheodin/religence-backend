@@ -863,31 +863,9 @@ export async function sendMessage(
   const account = await requireAccountForUser(userId, accountId);
   const attachments = normalizeMailAttachments(payload.attachments);
   await withGraphRetry(account, async (client) => {
-    const message = {
-      subject: payload.subject || '',
-      body: {
-        contentType: 'HTML',
-        content: payload.html || '<p></p>',
-      },
-      toRecipients: asRecipientList(payload.to),
-      ccRecipients: asRecipientList(payload.cc),
-      bccRecipients: asRecipientList(payload.bcc),
-      ...(attachments.length
-        ? {
-            attachments: attachments.map((att) => ({
-              '@odata.type': '#microsoft.graph.fileAttachment',
-              name: att.name,
-              contentType: att.contentType,
-              contentBytes: att.contentBytes,
-            })),
-          }
-        : {}),
-      ...(payload.idempotencyKey
-        ? {
-            internetMessageId: `<${payload.idempotencyKey.replace(/[^a-zA-Z0-9._-]/g, '.')}@religance.local>`,
-          }
-        : {}),
-    };
+    const message = buildGraphMessage(payload, attachments);
+    // `client-request-id` is a diagnostics correlation header only. Microsoft Graph does
+    // NOT deduplicate sendMail on it — see sendWorkflowMessage() for the durable path.
     const sendPath = payload.idempotencyKey
       ? mailApi(client, '/me/sendMail', { 'client-request-id': payload.idempotencyKey })
       : mailApi(client, '/me/sendMail');
@@ -895,6 +873,191 @@ export async function sendMessage(
     return true;
   });
   return { id: null, threadId: null };
+}
+
+function buildGraphMessage(
+  payload: {
+    to: string | string[];
+    cc?: string | string[];
+    bcc?: string | string[];
+    subject?: string;
+    html?: string;
+  },
+  attachments: ReturnType<typeof normalizeMailAttachments>
+): Record<string, unknown> {
+  return {
+    subject: payload.subject || '',
+    body: {
+      contentType: 'HTML',
+      content: payload.html || '<p></p>',
+    },
+    toRecipients: asRecipientList(payload.to),
+    ccRecipients: asRecipientList(payload.cc),
+    bccRecipients: asRecipientList(payload.bcc),
+    ...(attachments.length
+      ? {
+          attachments: attachments.map((att) => ({
+            '@odata.type': '#microsoft.graph.fileAttachment',
+            name: att.name,
+            contentType: att.contentType,
+            contentBytes: att.contentBytes,
+          })),
+        }
+      : {}),
+  };
+  // NOTE: `internetMessageId` is deliberately NOT set here.
+  // Exchange Online treats it as read-only on the sendMail action and rejects the request
+  // (ErrorInvalidPropertySet). It is only writable when creating a draft. Scheduled sends
+  // therefore use createWorkflowDraft() below, which lets Exchange assign the id and reads
+  // it back for durable correlation.
+}
+
+export type WorkflowDraftHandle = {
+  /** Graph message id of the created draft. Stable until the draft is sent. */
+  messageId: string;
+  /** RFC2822 id assigned by Exchange. Survives into Sent Items — our recovery key. */
+  internetMessageId: string | null;
+};
+
+/**
+ * Step 1 of the durable send: create a draft and read back the identifiers Exchange
+ * assigned. Persist these BEFORE calling sendWorkflowDraft() so that a crash between the
+ * two steps leaves enough evidence to determine what actually happened.
+ */
+export async function createWorkflowDraft(
+  userId: string,
+  accountId: string,
+  payload: {
+    to: string | string[];
+    cc?: string | string[];
+    bcc?: string | string[];
+    subject?: string;
+    html?: string;
+    attachments?: MailAttachmentInput[];
+    correlationId?: string;
+  }
+): Promise<WorkflowDraftHandle> {
+  const account = await requireAccountForUser(userId, accountId);
+  const attachments = normalizeMailAttachments(payload.attachments);
+  return withGraphRetry(account, async (client) => {
+    const req = payload.correlationId
+      ? mailApi(client, '/me/messages', { 'client-request-id': payload.correlationId })
+      : mailApi(client, '/me/messages');
+    const created = (await req.post(buildGraphMessage(payload, attachments))) as {
+      id?: string;
+      internetMessageId?: string;
+    };
+    if (!created?.id) {
+      throw new HttpError(502, 'Outlook did not return a draft message id');
+    }
+    return {
+      messageId: created.id,
+      internetMessageId: created.internetMessageId ?? null,
+    };
+  });
+}
+
+/** Step 2 of the durable send. Idempotent from Graph's side only in that a sent draft 404s. */
+export async function sendWorkflowDraft(
+  userId: string,
+  accountId: string,
+  messageId: string,
+  correlationId?: string
+): Promise<void> {
+  const account = await requireAccountForUser(userId, accountId);
+  await withGraphRetry(account, async (client) => {
+    const path = `${resolveMessagePath(messageId)}/send`;
+    const req = correlationId
+      ? mailApi(client, path, { 'client-request-id': correlationId })
+      : mailApi(client, path);
+    await req.post({});
+    return true;
+  });
+}
+
+/** Remove an unsent draft (used by the send-path verification script's dry run). */
+export async function deleteWorkflowDraft(
+  userId: string,
+  accountId: string,
+  messageId: string
+): Promise<void> {
+  const account = await requireAccountForUser(userId, accountId);
+  await withGraphRetry(account, async (client) => {
+    await mailApi(client, resolveMessagePath(messageId)).delete();
+    return true;
+  });
+}
+
+export type SentMessageProbe = {
+  id: string;
+  sentDateTime: string | null;
+  /** Outlook-on-the-web URL for the message. Null when Graph omitted it. */
+  webLink: string | null;
+  conversationId: string | null;
+};
+
+/**
+ * Recovery probe for an unknown outcome: did this message actually leave the mailbox?
+ * Looks for the internetMessageId anywhere in the mailbox (Sent Items included).
+ * Returns null when Graph could not answer, which must be treated as "still unknown".
+ *
+ * Doubles as the "open this mail in my mailbox" resolver for the contact timeline —
+ * webLink/conversationId are only needed there, but they ride along free on this query.
+ */
+export async function findSentMessageByInternetId(
+  userId: string,
+  accountId: string,
+  internetMessageId: string
+): Promise<SentMessageProbe | null> {
+  const account = await requireAccountForUser(userId, accountId);
+  try {
+    return await withGraphRetry(account, async (client) => {
+      const escaped = internetMessageId.replace(/'/g, "''");
+      const res = (await mailApi(client, '/me/messages')
+        .filter(`internetMessageId eq '${escaped}'`)
+        .select('id,sentDateTime,isDraft,webLink,conversationId')
+        .top(5)
+        .get()) as {
+        value?: Array<{
+          id?: string;
+          sentDateTime?: string;
+          isDraft?: boolean;
+          webLink?: string;
+          conversationId?: string;
+        }>;
+      };
+      const sent = (res.value ?? []).find((m) => m.isDraft === false);
+      if (!sent?.id) return null;
+      return {
+        id: sent.id,
+        sentDateTime: sent.sentDateTime ?? null,
+        webLink: sent.webLink ?? null,
+        conversationId: sent.conversationId ?? null,
+      };
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** True when Graph says the draft no longer exists — i.e. it was already sent. */
+export async function draftStillExists(
+  userId: string,
+  accountId: string,
+  messageId: string
+): Promise<boolean | null> {
+  const account = await requireAccountForUser(userId, accountId);
+  try {
+    return await withGraphRetry(account, async (client) => {
+      const msg = (await mailApi(client, resolveMessagePath(messageId))
+        .select('id,isDraft')
+        .get()) as { isDraft?: boolean };
+      return msg?.isDraft === true;
+    });
+  } catch (err) {
+    if (isGraphNotFound(err)) return false;
+    return null;
+  }
 }
 
 export async function replyMessage(

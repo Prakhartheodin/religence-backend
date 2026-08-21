@@ -13,6 +13,7 @@ import { masterDataRouter } from './routes/master-data.routes.js';
 import { notificationsRouter } from './routes/notifications.routes.js';
 import { executionsRouter, workflowsRouter } from './routes/workflows.routes.js';
 import { runSchedulerTick } from './services/mail-workflow/scheduler.js';
+import { setImmediateWaker } from './services/mail-workflow/wake.js';
 
 const app = express();
 
@@ -58,6 +59,9 @@ function startSchedulerLoop(): void {
       console.error('[religence-backend] scheduler tick failed:', err);
     });
   };
+  // "Send now" nudges the loop instead of waiting up to 30s; runSchedulerTick is
+  // re-entrancy guarded, so an extra call is harmless.
+  setImmediateWaker(tick);
   tick();
   setInterval(tick, 30_000);
 }
