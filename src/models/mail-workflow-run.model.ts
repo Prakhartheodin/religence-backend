@@ -57,6 +57,12 @@ export type MailWorkflowRunDocument = {
   recipients: MailWorkflowRunRecipient[];
   /** Correlation key echoed to Graph as client-request-id. NOT a provider idempotency key. */
   providerIdempotencyKey: string;
+  /**
+   * Denormalised at occurrence creation. The workflow's template can be changed or deleted
+   * afterwards, and a sequence's steps each carry their own — history has to say what
+   * actually went out. Empty for runs written before sequences existed.
+   */
+  templateId: string;
   providerMessageId?: string;
   failureReason?: string;
   skipReason?: string;
@@ -129,6 +135,7 @@ const mailWorkflowRunSchema = new mongoose.Schema(
     attempts: { type: [attemptSchema], default: [] },
     recipients: { type: [recipientSchema], default: [] },
     providerIdempotencyKey: { type: String, required: true },
+    templateId: { type: String, default: '' },
     providerMessageId: { type: String },
     failureReason: { type: String },
     skipReason: { type: String },

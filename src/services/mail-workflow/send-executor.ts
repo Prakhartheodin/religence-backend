@@ -25,7 +25,12 @@ import {
   type SendState,
 } from './contract.js';
 import { mailLog } from './log.js';
-import { backoffMs, classifySendError } from './retry.js';
+import { backoffMs, classifySendError, sendRetryDelayMs } from './retry.js';
+import {
+  defaultSendGuardLimits,
+  evaluateSendGuard,
+  loadSendGuardSnapshot,
+} from './send-guard.js';
 import {
   inboxPreflight,
   loadOwnedLeads,
@@ -36,6 +41,7 @@ import {
 
 const EXECUTOR_LEASE_MS = 5 * 60 * 1000;
 const MAX_RECIPIENT_ATTEMPTS = 3;
+const MAX_CONSECUTIVE_FAILURES = 3;
 export const EXECUTOR_BATCH_SIZE = 10;
 
 /** States the executor is still responsible for advancing. */
@@ -235,7 +241,12 @@ async function attemptRecipient(
   accountId: string,
   recipient: MailWorkflowRunRecipient,
   rendered: { subject: string; html: string },
-): Promise<{ status: RecipientSendStatus; authFailed?: boolean; retriable?: boolean }> {
+): Promise<{
+  status: RecipientSendStatus;
+  authFailed?: boolean;
+  retriable?: boolean;
+  retryAfterMs?: number;
+}> {
   const logCtx = {
     workspaceId: wf.userId,
     userId: wf.userId,
@@ -306,7 +317,12 @@ async function attemptRecipient(
     });
     mailLog.warn('send.draft_failed', { ...logCtx, errorCode: classified.code, retriable: classified.retriable });
     if (classified.code === 'AUTH_REQUIRED') return { status: 'pending', authFailed: true };
-    return { status: classified.retriable ? 'pending' : 'failed', retriable: classified.retriable };
+    const retryAfterMs = sendRetryDelayMs(err, recipient.attemptCount);
+    return {
+      status: classified.retriable ? 'pending' : 'failed',
+      retriable: classified.retriable,
+      retryAfterMs: classified.retriable ? retryAfterMs : undefined,
+    };
   }
 
   // --- persist the dispatch evidence BEFORE sending ---
@@ -328,7 +344,12 @@ async function attemptRecipient(
   } catch (err) {
     const classified = classifySendError(err);
     await recordAttempt(run.id, recipient.recipientId, classified);
-    mailLog.warn('send.send_failed', { ...logCtx, errorCode: classified.code, retriable: classified.retriable });
+    mailLog.warn('send.send_failed', {
+      ...logCtx,
+      errorCode: classified.code,
+      retriable: classified.retriable,
+      retryAfterMs: classified.retryAfterMs,
+    });
     if (classified.code === 'AUTH_REQUIRED') {
       await persistRecipient(run.id, recipient.recipientId, { status: 'sending' });
       return { status: 'sending', authFailed: true };
@@ -339,7 +360,8 @@ async function attemptRecipient(
       errorCode: classified.code,
       errorMessage: classified.message,
     });
-    return { status: 'sending', retriable: classified.retriable };
+    const retryAfterMs = sendRetryDelayMs(err, recipient.attemptCount);
+    return { status: 'sending', retriable: classified.retriable, retryAfterMs };
   }
 
   await persistRecipient(run.id, recipient.recipientId, {
@@ -422,7 +444,11 @@ export async function executeRun(run: MailWorkflowRunDocument, now = new Date())
   }
 
   const templates = await listEmailTemplates(wf.userId);
-  const template = templates.find((t) => t.id === wf.templateId);
+  // The run stamped its template when the occurrence was created, so editing or deleting
+  // the workflow's template cannot retroactively change what this send used. `||` covers
+  // every run written before sequences existed — no backfill.
+  const runTemplateId = run.templateId || wf.templateId;
+  const template = templates.find((t) => t.id === runTemplateId);
   if (!template) {
     await releaseRun(run.id, {
       sendState: 'failed',
@@ -430,7 +456,7 @@ export async function executeRun(run: MailWorkflowRunDocument, now = new Date())
       failureReason: 'TEMPLATE_MISSING',
       nextAttemptAt: null,
     });
-    mailLog.error('run.template_missing', { ...baseCtx, templateId: wf.templateId });
+    mailLog.error('run.template_missing', { ...baseCtx, templateId: runTemplateId });
     await MailWorkflowModel.updateOne({ id: wf.id, userId: wf.userId }, { $inc: { failureCount: 1 } });
     await finalizeWorkflowAfterRun(wf, run.id);
     return;
@@ -443,9 +469,39 @@ export async function executeRun(run: MailWorkflowRunDocument, now = new Date())
 
   let authFailed = false;
   let anyRetriable = false;
+  let maxRetryDelayMs = 0;
+
+  const guardLimits = defaultSendGuardLimits();
 
   for (const recipient of run.recipients) {
     if (recipient.status === 'sent' || recipient.status === 'failed') continue;
+
+    const guardSnap = await loadSendGuardSnapshot(wf.userId, now);
+    const guard = evaluateSendGuard(guardSnap, guardLimits);
+    if (!guard.allow) {
+      const hasOpenRecipients = run.recipients.some(
+        (r) => r.status !== 'sent' && r.status !== 'failed',
+      );
+      await releaseRun(run.id, {
+        sendState: hasOpenRecipients ? 'sending' : 'scheduled',
+        nextAttemptAt: new Date(now.getTime() + guard.retryAfterMs),
+      });
+      mailLog.warn('send.guard_deferred', {
+        ...baseCtx,
+        reason: guard.reason,
+        retryAfterMs: guard.retryAfterMs,
+        sentLastMinute: guardSnap.sentLastMinute,
+        inFlight: guardSnap.inFlight,
+        recipientsToday: guardSnap.recipientsToday,
+        tenantExternalToday: guardSnap.tenantExternalToday,
+        paceCap: guardLimits.pacePerMin,
+        inFlightCap: guardLimits.maxInFlight,
+        mailboxDailyCap: guardLimits.mailboxRecipientsPerDay,
+        tenantDailyCap: guardLimits.tenantExternalPerDay,
+      });
+      return;
+    }
+
     const lead = leadById.get(recipient.recipientId);
     if (!lead) {
       await persistRecipient(run.id, recipient.recipientId, {
@@ -470,7 +526,10 @@ export async function executeRun(run: MailWorkflowRunDocument, now = new Date())
       authFailed = true;
       break;
     }
-    if (result.retriable) anyRetriable = true;
+    if (result.retriable) {
+      anyRetriable = true;
+      if (result.retryAfterMs) maxRetryDelayMs = Math.max(maxRetryDelayMs, result.retryAfterMs);
+    }
   }
 
   if (authFailed) {
@@ -489,12 +548,14 @@ export async function executeRun(run: MailWorkflowRunDocument, now = new Date())
 
   if (!runIsSettled(counts) && anyRetriable && run.attemptCount < MAX_RECIPIENT_ATTEMPTS * 3) {
     // Schedule the retry; do NOT sleep — a later tick picks this run up.
-    const delay = backoffMs(Math.min(run.attemptCount, 2));
+    const delay = maxRetryDelayMs > 0
+      ? maxRetryDelayMs
+      : backoffMs(Math.min(run.attemptCount, 2));
     await releaseRun(run.id, {
       sendState: 'sending',
       nextAttemptAt: new Date(now.getTime() + delay),
     });
-    mailLog.info('run.retry_scheduled', { ...baseCtx, delayMs: delay });
+    mailLog.info('run.retry_scheduled', { ...baseCtx, delayMs: delay, retriable: true });
     return;
   }
 
@@ -510,6 +571,8 @@ export async function executeRun(run: MailWorkflowRunDocument, now = new Date())
   const settled = await MailWorkflowRunModel.findOne({ id: run.id }).lean();
   const finalCounts = countRecipients(settled?.recipients ?? []);
   const outcome = resolveRunOutcome(finalCounts);
+  const succeeded = outcome.status === 'success';
+  const failedRun = outcome.status === 'failed' || outcome.status === 'partial_success';
 
   await releaseRun(run.id, {
     status: outcome.status,
@@ -522,13 +585,30 @@ export async function executeRun(run: MailWorkflowRunDocument, now = new Date())
   await MailWorkflowModel.updateOne(
     { id: wf.id, userId: wf.userId },
     {
-      $set: { lastRunAt: now },
+      $set: {
+        lastRunAt: now,
+        ...(succeeded ? { failureCount: 0 } : {}),
+      },
       $inc: {
         runCount: 1,
-        ...(outcome.status === 'failed' || outcome.status === 'partial_success' ? { failureCount: 1 } : {}),
+        ...(failedRun ? { failureCount: 1 } : {}),
       },
     },
   );
+
+  if (failedRun) {
+    const freshWf = await MailWorkflowModel.findOne({ id: wf.id, userId: wf.userId }).lean();
+    if (freshWf && freshWf.failureCount >= MAX_CONSECUTIVE_FAILURES && freshWf.status === 'active') {
+      await MailWorkflowModel.updateOne(
+        { id: wf.id, userId: wf.userId, status: 'active' },
+        { $set: { status: 'paused', leaseOwner: null, leaseUntil: null, lockId: null } },
+      );
+      mailLog.info('workflow.paused_failures', {
+        ...baseCtx,
+        failureCount: freshWf.failureCount,
+      });
+    }
+  }
 
   mailLog.info('run.finished', {
     ...baseCtx,
@@ -608,6 +688,10 @@ if (process.argv[1]?.endsWith('send-executor.ts')) {
 
   assert.equal(runIsSettled({ sent: 1, failed: 0, unknown: 0, pending: 1 }), false);
   assert.equal(runIsSettled({ sent: 1, failed: 1, unknown: 0, pending: 0 }), true);
+
+  assert.equal(classifySendError({ status: 500 }).retriable, false);
+  assert.equal(classifySendError({ status: 504 }).retriable, true);
+  assert.equal(sendRetryDelayMs({ status: 429, headers: { 'retry-after': '5' } }, 0), 5_000);
 
   // --- crash recovery probes ---
   const run = async () => {

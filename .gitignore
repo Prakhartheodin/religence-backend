@@ -9,3 +9,4 @@ scripts/
 **/*.test.*
 **/*.spec.*
 __tests__/
+.superpowers/

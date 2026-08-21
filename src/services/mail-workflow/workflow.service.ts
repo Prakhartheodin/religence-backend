@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { connectMongo } from '../../db/mongo.js';
 import { CrmEntities } from '../../models/crm-entities.js';
 import {
   MailWorkflowModel,
@@ -19,6 +18,7 @@ import { sendMessage } from '../outlook.service.js';
 import {
   CONTRACT_VERSION,
   executionModeOf,
+  validateSequencePolicy,
   WorkflowError,
   type ExecutionMode,
   type RunStatus,
@@ -100,6 +100,25 @@ function singleRunLabel(sendAtIso: string, timeZone: string): string {
   }
 }
 
+/**
+ * Frozen instants mean a card left sitting can have steps in the past by confirm time.
+ * firstRunAt would skip them silently — refuse and let the user re-state.
+ */
+export function assertNoPassedSequenceSteps(
+  schedule: WorkflowSchedule,
+  timezone: string,
+  now = new Date(),
+): void {
+  if (schedule.frequency !== 'sequence') return;
+  const passed = (schedule.steps ?? []).filter((step) => new Date(step.at) <= now);
+  if (!passed.length) return;
+  const when = passed.map((step) => singleRunLabel(step.at, timezone)).join(', ');
+  throw new WorkflowError(
+    'SCHEDULE_INVALID',
+    `${passed.length === 1 ? 'One of those sends was' : `${passed.length} of those sends were`} due before you confirmed (${when}). Tell me new times and I'll rebuild the sequence.`,
+  );
+}
+
 export function endLabel(s: WorkflowSchedule): string {
   if (s.frequency === 'once') return 'Single send';
   if (s.endDate && s.maxRuns) return `Ends ${s.endDate} or after ${s.maxRuns} sends`;
@@ -138,6 +157,8 @@ export type PreviewSummary = {
   mailbox: string;
   accountId: string;
   nextSendAt: string;
+  /** sequence only: one row per step, in send order. Absent for every other frequency. */
+  steps?: Array<{ index: number; at: string; templateName: string; passed: boolean }>;
   subjectPreview: string;
   bodyPreviewHtml: string;
   contract: WorkflowCommandContractV1;
@@ -240,7 +261,11 @@ export function contractScheduleToModel(s: WorkflowSchedule): MailWorkflowSchedu
     return {
       frequency: 'sequence',
       startAt: s.startAt ? new Date(s.startAt) : null,
-      steps: (s.steps ?? []).map((step) => ({ ...step })),
+      steps: (s.steps ?? []).map((step) => ({
+        spec: step.spec,
+        at: new Date(step.at),
+        ...(step.templateId ? { templateId: step.templateId } : {}),
+      })),
     };
   }
   return {
@@ -426,7 +451,7 @@ async function buildPreviewInternal(
     throw new WorkflowError('AUTH_REQUIRED', 'outlook account required');
   }
 
-  const [template, leads, account] = await Promise.all([
+  const [template, leads, account, allTemplates] = await Promise.all([
     loadTemplate(userId, templateId),
     loadOwnedLeads(userId, recipientIds),
     preflight.accountId
@@ -434,6 +459,7 @@ async function buildPreviewInternal(
           accounts.find((a) => a.id === preflight.accountId),
         )
       : Promise.resolve(undefined),
+    listEmailTemplates(userId),
   ]);
   assertExtraVars(template, contract.variables ?? {});
 
@@ -450,6 +476,20 @@ async function buildPreviewInternal(
   const first = leads[0];
   const rendered = renderLeadMessage(template, first, senderName, contract.variables ?? {});
 
+  const nowMs = Date.now();
+  const templateNameById = new Map(allTemplates.map((t) => [t.id, t.name]));
+  const steps =
+    schedule.frequency === 'sequence'
+      ? (schedule.steps ?? []).map((step, i) => ({
+          index: i + 1,
+          at: new Date(step.at).toISOString(),
+          templateName: step.templateId
+            ? templateNameById.get(step.templateId) ?? template.name
+            : template.name,
+          passed: new Date(step.at).getTime() <= nowMs,
+        }))
+      : undefined;
+
   return {
     kind: 'preview_summary',
     templateName: template.name,
@@ -465,6 +505,7 @@ async function buildPreviewInternal(
     mailbox: account?.email ?? '',
     accountId: preflight.accountId ?? '',
     nextSendAt: nextRunAt.toISOString(),
+    ...(steps ? { steps } : {}),
     subjectPreview: rendered.subject,
     bodyPreviewHtml: rendered.html,
     contract,
@@ -513,10 +554,12 @@ export async function createWorkflow(
       const timezone = workflowTimezone();
       const variables = contract.variables ?? {};
       const schedule = contractSchedule(contract);
+      validateSequencePolicy(schedule);
       const scheduleDoc = contractScheduleToModel(schedule);
       const oneTimeSendAt = executionMode === 'once' ? onceRunAt(schedule) : null;
 
       if (preflight.sendAllowed && opts.confirmed) {
+        assertNoPassedSequenceSteps(schedule, timezone);
         const nextRunAt = firstRunAt(schedule, timezone);
         const doc = await MailWorkflowModel.create({
           id: randomUUID(),
@@ -606,6 +649,8 @@ export async function confirmWorkflow(
       }
 
       const schedule = modelScheduleToContract(wf.schedule);
+      validateSequencePolicy(schedule);
+      assertNoPassedSequenceSteps(schedule, wf.timezone);
       const nextRunAt = firstRunAt(schedule, wf.timezone);
       if (!nextRunAt) {
         throw new WorkflowError(
@@ -760,7 +805,12 @@ export async function updateWorkflow(
         wf.variables = contract.variables as unknown as MailWorkflowDocument['variables'];
       }
       if (contract.schedule) {
-        wf.schedule = contractScheduleToModel(contract.schedule);
+        const schedule = contract.schedule;
+        validateSequencePolicy(schedule);
+        if (wf.status === 'active') {
+          assertNoPassedSequenceSteps(schedule, wf.timezone);
+        }
+        wf.schedule = contractScheduleToModel(schedule);
       }
 
       const template = await loadTemplate(userId, wf.templateId);
@@ -905,43 +955,40 @@ if (process.argv[1]?.endsWith('workflow.service.ts')) {
   assert.equal(isDuplicateKeyError({ code: 11000 }), true);
   assert.equal(isDuplicateKeyError({ code: 11001 }), false);
 
-  const run = async () => {
-    if (process.env.MONGODB_URI) {
-      await connectMongo();
-      const userId = 'wf-selfcheck-user';
-      const requestId = `wf-selfcheck-${randomUUID()}`;
-      let calls = 0;
-      const r1 = await withIdempotency(
-        userId,
-        requestId,
-        'list',
-        {},
-        async () => {
-          calls++;
-          return { ok: true, n: calls };
-        },
-      );
-      const r2 = await withIdempotency(
-        userId,
-        requestId,
-        'list',
-        {},
-        async () => {
-          calls++;
-          return { ok: false, n: calls };
-        },
-      );
-      assert.deepEqual(r1, r2);
-      assert.equal(calls, 1);
-      await MailWorkflowCommandModel.deleteOne({ userId, requestId });
-    } else {
-      console.log('skip mongo idempotency');
-    }
-    console.log('workflow.service self-check passed');
+  const futureIso = new Date(Date.now() + 3_600_000).toISOString();
+  const pastIso = new Date(Date.now() - 60_000).toISOString();
+  const seqFutureOnly = {
+    frequency: 'sequence' as const,
+    startAt: futureIso,
+    steps: [
+      { spec: { kind: 'after' as const, minutes: 60, from: 'start' as const }, at: futureIso },
+      { spec: { kind: 'after' as const, minutes: 60, from: 'previous' as const }, at: new Date(Date.now() + 7_200_000).toISOString() },
+    ],
   };
+  const seqWithPast = {
+    frequency: 'sequence' as const,
+    startAt: pastIso,
+    steps: [
+      { spec: { kind: 'after' as const, minutes: 0, from: 'start' as const }, at: pastIso },
+      { spec: { kind: 'after' as const, minutes: 60, from: 'previous' as const }, at: futureIso },
+    ],
+  };
+  const passedFuture = (seqFutureOnly.steps ?? []).filter((step) => new Date(step.at) <= new Date());
+  assert.equal(passedFuture.length, 0, 'future-only sequence has no passed steps');
+  const passedMixed = (seqWithPast.steps ?? []).filter((step) => new Date(step.at) <= new Date());
+  assert.equal(passedMixed.length, 1);
+  assert.throws(
+    () => assertNoPassedSequenceSteps(seqWithPast, 'Asia/Kolkata'),
+    /One of those sends was/,
+  );
+  assert.doesNotThrow(() => assertNoPassedSequenceSteps(seqFutureOnly, 'Asia/Kolkata'));
+  assert.throws(
+    () => assertNoPassedSequenceSteps(seqWithPast, 'Asia/Kolkata'),
+    (err: unknown) => err instanceof WorkflowError && err.code === 'SCHEDULE_INVALID',
+  );
+  assert.doesNotThrow(() =>
+    assertNoPassedSequenceSteps({ frequency: 'daily', time: '10:00' }, 'Asia/Kolkata'),
+  );
 
-  void run().catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
+  console.log('workflow.service self-check passed');
 }

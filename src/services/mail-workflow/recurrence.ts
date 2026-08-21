@@ -246,8 +246,27 @@ export function materializeSequence(
   return out;
 }
 
+/**
+ * Which template a given occurrence belongs to, derived from its instant.
+ *
+ * Deliberately NOT derived from a counter. `recordSkippedOccurrence` writes a run row
+ * without incrementing `runCount` — that happens only on execution — and N consecutive
+ * missed occurrences produce a single row. After any outage both undercount, so a counter
+ * would quietly hand step 3 the template that belongs to step 2.
+ */
+export function stepTemplateId(
+  schedule: WorkflowSchedule,
+  scheduledAt: Date,
+): string | undefined {
+  if (schedule.frequency !== 'sequence') return undefined;
+  const iso = scheduledAt.toISOString();
+  return schedule.steps?.find((s) => s.at === iso)?.templateId;
+}
+
 /** Default: an occurrence more than this far in the past is stale and will not be sent. */
 export const DEFAULT_MAX_MISSED_RUN_AGE_MS = 2 * 60 * 60 * 1000;
+
+const SKIP_DETAIL_LIMIT = 20;
 
 export function maxMissedRunAgeMs(): number {
   const raw = Number(process.env.MAX_MISSED_RUN_AGE_MINUTES);
@@ -264,7 +283,20 @@ export type CatchUpPlan =
    * One or more occurrences were missed and are too old to send. Skip them and jump to
    * `nextRunAt`; if `nextRunAt` is null the workflow is finished.
    */
-  | { action: 'skip'; skipped: number; lastSkipped: Date; nextRunAt: Date | null; runNow: Date | null }
+  | {
+      action: 'skip';
+      skipped: number;
+      lastSkipped: Date;
+      /**
+       * The skipped instants, newest last, capped at SKIP_DETAIL_LIMIT. `skipped` remains
+       * the true count. A sequence never exceeds the cap, so its history is complete; a
+       * years-old recurring backlog truncates, which is what the single summary row always
+       * meant anyway.
+       */
+      skippedOccurrences: Date[];
+      nextRunAt: Date | null;
+      runNow: Date | null;
+    }
   /** No further occurrences. */
   | { action: 'complete' };
 
@@ -299,6 +331,7 @@ export function planCatchUp(
   let dueCount = 1;
   let due = nextRunAt;
   let previousDue = nextRunAt;
+  const allDue: Date[] = [nextRunAt];
 
   for (let i = 0; i < 5000; i++) {
     const next = computeNextRunAt(schedule, timezone, now, { afterOccurrence: due });
@@ -306,6 +339,7 @@ export function planCatchUp(
     previousDue = due;
     due = next;
     dueCount++;
+    allDue.push(due);
   }
 
   const isFresh = now.getTime() - due.getTime() <= maxAgeMs;
@@ -313,10 +347,12 @@ export function planCatchUp(
   // `due` is the newest occurrence that is due, so if it is too old every earlier one is
   // older still — the whole backlog is dropped and the workflow jumps past it.
   if (!isFresh) {
+    const skippedOccurrences = allDue.slice(-SKIP_DETAIL_LIMIT);
     return {
       action: 'skip',
       skipped: dueCount,
       lastSkipped: due,
+      skippedOccurrences,
       nextRunAt: computeNextRunAt(schedule, timezone, now, { afterOccurrence: due }),
       runNow: null,
     };
@@ -325,7 +361,15 @@ export function planCatchUp(
   if (dueCount === 1) return { action: 'run', occurrence: due };
 
   // Run exactly the newest one; everything before it is dropped, however fresh it looks.
-  return { action: 'skip', skipped: dueCount - 1, lastSkipped: previousDue, nextRunAt: due, runNow: due };
+  const skippedOccurrences = allDue.slice(0, -1).slice(-SKIP_DETAIL_LIMIT);
+  return {
+    action: 'skip',
+    skipped: dueCount - 1,
+    lastSkipped: previousDue,
+    skippedOccurrences,
+    nextRunAt: due,
+    runNow: due,
+  };
 }
 
 if (process.argv[1]?.endsWith('recurrence.ts')) {
@@ -640,6 +684,17 @@ if (process.argv[1]?.endsWith('recurrence.ts')) {
     burstBacklog = computeNextRunAt(burstSeq, 'Asia/Kolkata', burstNow, { afterOccurrence: occurrence });
   }
   assert.equal(burstSends, 1, 'a sequence backlog must still produce exactly ONE send');
+
+  const tplAt = '2026-08-21T04:30:00.000Z';
+  const tplSeq: WorkflowSchedule = {
+    frequency: 'sequence',
+    steps: [
+      { spec: { kind: 'after', minutes: 0, from: 'start' }, at: tplAt, templateId: 't1' },
+      { spec: { kind: 'after', minutes: 30, from: 'previous' }, at: '2026-08-21T05:00:00.000Z', templateId: 't2' },
+    ],
+  };
+  assert.equal(stepTemplateId(tplSeq, new Date(tplAt)), 't1');
+  assert.equal(stepTemplateId({ frequency: 'daily', time: '10:00' }, new Date(tplAt)), undefined);
 
   console.log('recurrence self-check passed');
 }

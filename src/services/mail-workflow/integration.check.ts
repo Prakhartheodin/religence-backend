@@ -16,6 +16,11 @@ import {
 } from './chat-session.service.js';
 import { providerIdempotencyKey } from './retry.js';
 import {
+  defaultSendGuardLimits,
+  evaluateSendGuard,
+  loadSendGuardSnapshot,
+} from './send-guard.js';
+import {
   cancelWorkflow,
   getWorkflow,
   isDuplicateKeyError,
@@ -204,6 +209,49 @@ async function testDuplicateOccurrenceIsRejected(): Promise<void> {
   console.log('  ✓ duplicate occurrence rejected by unique index');
 }
 
+async function testSendGuardSnapshotFromMongo(): Promise<void> {
+  const wf = await MailWorkflowModel.create(workflowDoc(USER_A));
+  const now = new Date('2026-08-21T10:00:00.000Z');
+  const dayStart = new Date(now);
+  dayStart.setUTCHours(0, 0, 0, 0);
+  const acceptedInMinute = new Date(now.getTime() - 20_000);
+  const acceptedToday = new Date(dayStart.getTime() + 60_000);
+  const acceptedYesterday = new Date(dayStart.getTime() - 60_000);
+
+  await MailWorkflowRunModel.create({
+    id: randomUUID(),
+    workflowId: wf.id,
+    userId: USER_A,
+    scheduledAt: new Date(now.getTime() - 120_000),
+    status: 'running',
+    sendState: 'sending',
+    attemptCount: 0,
+    attempts: [],
+    recipients: [
+      { recipientId: 'r-minute', email: 'minute@example.com', status: 'sent', attemptCount: 1, acceptedAt: acceptedInMinute },
+      { recipientId: 'r-sending', email: 'sending@example.com', status: 'sending', attemptCount: 1, acceptedAt: null },
+      { recipientId: 'r-today', email: 'today@example.com', status: 'sent', attemptCount: 1, acceptedAt: acceptedToday },
+      { recipientId: 'r-old', email: 'old@example.com', status: 'sent', attemptCount: 1, acceptedAt: acceptedYesterday },
+    ],
+    providerIdempotencyKey: providerIdempotencyKey(USER_A, wf.id, now),
+    templateId: 'follow-up-1',
+  });
+
+  const snap = await loadSendGuardSnapshot(USER_A, now);
+  assert.equal(snap.sentLastMinute, 1, 'only recent accepted recipients count toward pace');
+  assert.equal(snap.inFlight, 1, 'only sending recipients count toward concurrency');
+  assert.equal(snap.recipientsToday, 2, 'daily count includes sent recipients since UTC midnight');
+  assert.equal(snap.tenantExternalToday, 2, 'tenant external counter mirrors daily sent count in v1');
+
+  const decision = evaluateSendGuard(snap, { ...defaultSendGuardLimits(), pacePerMin: 1 });
+  assert.equal(decision.allow, false, 'a snapshot at the pace cap is blocked');
+  if (!decision.allow) assert.equal(decision.reason, 'MAILBOX_PACE');
+
+  await MailWorkflowRunModel.deleteMany({ workflowId: wf.id });
+  await MailWorkflowModel.deleteOne({ id: wf.id });
+  console.log('  ✓ send-guard snapshot reflects Mongo recipient counts');
+}
+
 async function testConcurrentLeaseClaim(): Promise<void> {
   const wf = await MailWorkflowModel.create(workflowDoc(USER_A));
   const now = new Date();
@@ -318,6 +366,7 @@ async function main(): Promise<void> {
     await testSessionIsolation();
     await testRequestLedgerIsCapped();
     await testDuplicateOccurrenceIsRejected();
+    await testSendGuardSnapshotFromMongo();
     await testConcurrentLeaseClaim();
     await testPauseCancelRace();
     await testIdempotency();

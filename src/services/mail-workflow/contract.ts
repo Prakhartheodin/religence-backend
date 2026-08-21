@@ -117,6 +117,10 @@ const FREQ = new Set(['once', 'daily', 'weekly', 'monthly', 'sequence']);
 const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 const YMD = /^\d{4}-\d{2}-\d{2}$/;
 
+export const MAX_SEQUENCE_STEPS = 20;
+export const MIN_STEP_GAP_MINUTES = 5;
+export const MAX_SEQUENCE_SPAN_DAYS = 365;
+
 export function isOnceSchedule(s: WorkflowSchedule | undefined): boolean {
   return s?.frequency === 'once';
 }
@@ -132,6 +136,47 @@ function parseIsoInstant(value: unknown, field: string): string {
     throw new WorkflowError('SCHEDULE_INVALID', `${field} must be a valid ISO datetime`);
   }
   return dt.toISOString();
+}
+
+/** Policy bounds for sequences — shared by API and confirm paths. Structure lives in parseSchedule. */
+export function validateSequencePolicy(schedule: WorkflowSchedule): void {
+  if (schedule.frequency !== 'sequence') return;
+  const steps = schedule.steps ?? [];
+  if (steps.length < 2) {
+    throw new WorkflowError('SCHEDULE_INVALID', 'a sequence needs at least two steps');
+  }
+  if (steps.length > MAX_SEQUENCE_STEPS) {
+    throw new WorkflowError('SCHEDULE_INVALID', `a sequence may have at most ${MAX_SEQUENCE_STEPS} steps`);
+  }
+  const startAt = new Date(schedule.startAt ?? '');
+  if (!schedule.startAt || Number.isNaN(startAt.getTime())) {
+    throw new WorkflowError('SCHEDULE_INVALID', 'schedule.startAt must be a valid ISO datetime');
+  }
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    if (step.spec.kind === 'after' && step.spec.from !== 'start' && step.spec.from !== 'previous') {
+      throw new WorkflowError('SCHEDULE_INVALID', `steps[${i}].spec.from must be 'start' or 'previous'`);
+    }
+    if (i === 0) continue;
+    const prev = new Date(steps[i - 1].at);
+    const cur = new Date(steps[i].at);
+    if (cur <= prev) {
+      throw new WorkflowError('SCHEDULE_INVALID', 'sequence steps must be strictly increasing');
+    }
+    if (cur.getTime() - prev.getTime() < MIN_STEP_GAP_MINUTES * 60_000) {
+      throw new WorkflowError(
+        'SCHEDULE_INVALID',
+        `steps must be at least ${MIN_STEP_GAP_MINUTES} minutes apart`,
+      );
+    }
+  }
+  const spanMs = new Date(steps[steps.length - 1].at).getTime() - startAt.getTime();
+  if (spanMs > MAX_SEQUENCE_SPAN_DAYS * 24 * 60 * 60 * 1000) {
+    throw new WorkflowError(
+      'SCHEDULE_INVALID',
+      `a sequence may span at most ${MAX_SEQUENCE_SPAN_DAYS} days`,
+    );
+  }
 }
 
 function parseSchedule(raw: unknown): WorkflowSchedule {
@@ -162,7 +207,10 @@ function parseSchedule(raw: unknown): WorkflowSchedule {
         if (!Number.isInteger(minutes) || minutes < 0) {
           throw new WorkflowError('SCHEDULE_INVALID', `steps[${i}].minutes must be an integer >= 0`);
         }
-        const from = rawSpec.from === 'start' ? 'start' : 'previous';
+        const from = String(rawSpec.from ?? '');
+        if (from !== 'start' && from !== 'previous') {
+          throw new WorkflowError('SCHEDULE_INVALID', `steps[${i}].spec.from must be 'start' or 'previous'`);
+        }
         spec = { kind: 'after', minutes, from };
       } else if (kind === 'at') {
         const time = String(rawSpec.time ?? '');
@@ -189,11 +237,13 @@ function parseSchedule(raw: unknown): WorkflowSchedule {
       }
     }
 
-    return {
+    const schedule: WorkflowSchedule = {
       frequency: 'sequence',
       startAt: parseIsoInstant(s.startAt, 'schedule.startAt'),
       steps,
     };
+    validateSequencePolicy(schedule);
+    return schedule;
   }
 
   const time = String(s.time ?? '');
@@ -390,6 +440,78 @@ if (process.argv[1]?.endsWith('contract.ts')) {
         },
       }),
     /strictly increasing/,
+  );
+  assert.throws(
+    () =>
+      parseContract({
+        ...base,
+        schedule: {
+          frequency: 'sequence',
+          startAt: seqStart,
+          steps: [
+            { spec: { kind: 'after', minutes: 60, from: 'bogus' }, at: '2026-08-21T05:30:00.000Z' },
+            { spec: { kind: 'at', time: '14:00', dayOffset: 0 }, at: '2026-08-21T08:30:00.000Z' },
+          ],
+        },
+      }),
+    /from must be/,
+  );
+  assert.throws(
+    () =>
+      parseContract({
+        ...base,
+        schedule: {
+          frequency: 'sequence',
+          startAt: seqStart,
+          steps: Array.from({ length: MAX_SEQUENCE_STEPS + 1 }, (_, i) => ({
+            spec: { kind: 'after', minutes: 60, from: 'previous' as const },
+            at: new Date(new Date(seqStart).getTime() + (i + 1) * 3_600_000).toISOString(),
+          })),
+        },
+      }),
+    /at most 20/,
+  );
+  assert.throws(
+    () =>
+      parseContract({
+        ...base,
+        schedule: {
+          frequency: 'sequence',
+          startAt: seqStart,
+          steps: [
+            { spec: { kind: 'after', minutes: 0, from: 'start' }, at: '2026-08-21T05:30:00.000Z' },
+            { spec: { kind: 'after', minutes: 1, from: 'previous' }, at: '2026-08-21T05:31:00.000Z' },
+          ],
+        },
+      }),
+    /5 minutes apart/,
+  );
+  assert.throws(
+    () =>
+      parseContract({
+        ...base,
+        schedule: {
+          frequency: 'sequence',
+          startAt: seqStart,
+          steps: [
+            { spec: { kind: 'after', minutes: 0, from: 'start' }, at: '2026-08-21T05:30:00.000Z' },
+            { spec: { kind: 'at', time: '10:00', dayOffset: 366 }, at: '2027-08-22T04:30:00.000Z' },
+          ],
+        },
+      }),
+    /365 days/,
+  );
+  assert.throws(
+    () =>
+      validateSequencePolicy({
+        frequency: 'sequence',
+        startAt: seqStart,
+        steps: [
+          { spec: { kind: 'after', minutes: 60, from: 'nope' as 'start' }, at: '2026-08-21T05:30:00.000Z' },
+          { spec: { kind: 'after', minutes: 60, from: 'previous' }, at: '2026-08-21T06:30:00.000Z' },
+        ],
+      }),
+    /from must be/,
   );
   assert.equal(executionModeOf({ frequency: 'daily', time: '10:00' }), 'recurring');
   assert.equal(isOnceSchedule({ frequency: 'once', runAt: new Date().toISOString() }), true);

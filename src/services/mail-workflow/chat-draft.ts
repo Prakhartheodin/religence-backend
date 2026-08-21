@@ -1,11 +1,32 @@
 import assert from 'node:assert/strict';
-import type { WorkflowAction, WorkflowSchedule } from './contract.js';
+import type { StepSpec, WorkflowAction, WorkflowSchedule } from './contract.js';
+
+export type RawStep = {
+  spec?: StepSpec;
+  /** More than one when the phrasing admits several clocks ("around 7 or 8"). */
+  candidates?: string[];
+  templateId?: string;
+};
+
+export type SequenceSpec = {
+  anchor?: 'now' | 'after_gap';
+  count?: number;
+  sameDay?: boolean;
+  steps: RawStep[];
+  /** Parsed from "every N days" when count is still unknown. */
+  gapMinutes?: number;
+};
+
+export type Ambiguity =
+  | { kind: 'count' }
+  | { kind: 'anchor'; gapMinutes: number; count: number }
+  | { kind: 'stepTime'; stepIndex: number; candidates: string[] };
 
 export type DraftChoice = {
   id: string;
   label: string;
   sublabel?: string;
-  field: 'templateId' | 'recipientId';
+  field: 'templateId' | 'recipientId' | 'anchor' | 'stepTime';
   value: string;
 };
 
@@ -53,6 +74,14 @@ export type ConversationDraft = {
    * natural language) so a double-click or retry cannot create a second workflow.
    */
   confirmRequestId?: string;
+  /**
+   * The request described several sends, so the schedule question asks for steps rather
+   * than a single time. Genuine state — it comes from the original message, which is not
+   * persisted, so it cannot be derived the way missingFields can.
+   */
+  sequenceRequested?: boolean;
+  /** Un-materialized sequence intent while ambiguity is resolved. */
+  sequenceSpec?: SequenceSpec;
   currentStep?: DraftStep;
   missingFields?: MissingField[];
   /**
@@ -165,7 +194,9 @@ export function draftHasAnyInput(draft: ConversationDraft): boolean {
     || draft.schedule
     || draft.workflowId
     || draft.workflowHint
-    || draft.pendingChoices?.length,
+    || draft.pendingChoices?.length
+    || draft.sequenceRequested
+    || draft.sequenceSpec,
   );
 }
 

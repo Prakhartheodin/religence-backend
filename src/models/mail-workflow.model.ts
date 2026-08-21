@@ -1,6 +1,8 @@
 import mongoose from 'mongoose';
 import type { ExecutionMode, Frequency, SequenceStep, WorkflowStatus } from '../services/mail-workflow/contract.js';
 
+export type MailWorkflowSequenceStep = Omit<SequenceStep, 'at'> & { at: Date };
+
 export type MailWorkflowSchedule = {
   frequency: Frequency;
   /** HH:mm in `timezone`. Absent for `once`. */
@@ -12,7 +14,7 @@ export type MailWorkflowSchedule = {
   endDate?: string;
   maxRuns?: number;
   startAt?: Date | null;
-  steps?: SequenceStep[];
+  steps?: MailWorkflowSequenceStep[];
 };
 
 export type MailWorkflowDocument = {

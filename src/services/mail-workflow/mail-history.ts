@@ -9,7 +9,8 @@ import { WorkflowError } from './contract.js';
 import type { RecipientSendStatus, RunStatus } from './contract.js';
 
 /** Cap the scan so a workspace with years of sends still answers in one query. */
-const RUN_SCAN_LIMIT = 500;
+// ponytail: 2000 scan cap; paginate history when workspaces exceed ~100 active sequences.
+const RUN_SCAN_LIMIT = 2000;
 /** What the assistant gets as long-term context — small enough to sit in a prompt. */
 const MEMORY_CONTACT_LIMIT = 20;
 const MEMORY_EVENTS_PER_CONTACT = 3;
@@ -89,7 +90,7 @@ export async function listMailHistory(
       const key = contactKey(r);
       if (opts.contactId && key !== opts.contactId && r.recipientId !== opts.contactId) continue;
 
-      const templateId = templateIdByWorkflow.get(run.workflowId) ?? '';
+      const templateId = (run.templateId || templateIdByWorkflow.get(run.workflowId)) ?? '';
       const event: MailHistoryEvent = {
         runId: run.id,
         workflowId: run.workflowId,

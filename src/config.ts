@@ -34,6 +34,14 @@ export const config = {
     tenantId: process.env.MICROSOFT_TENANT_ID ?? 'common',
   },
   workflowTimezone: process.env.WORKFLOW_TIMEZONE?.trim() || 'Asia/Kolkata',
+  mail: {
+    /** Tenant external-recipient daily limit (TERRL) when known; send-guard uses 80% of this. */
+    tenantExternalRecipientLimit: (() => {
+      const raw = (process.env.MAIL_TENANT_EXTERNAL_RECIPIENT_LIMIT ?? '').trim();
+      const n = Number(raw);
+      return raw && Number.isFinite(n) && n > 0 ? n : null;
+    })(),
+  },
   chatLlm: {
     apiKey: (process.env.OPENAI_API_KEY ?? '').trim(),
     baseUrl: (process.env.CHAT_LLM_BASE_URL ?? 'https://api.openai.com/v1').replace(/\/$/, ''),

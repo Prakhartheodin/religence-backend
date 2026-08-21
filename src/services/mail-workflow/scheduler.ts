@@ -8,7 +8,7 @@ import {
 import { MailWorkflowRunModel } from '../../models/mail-workflow-run.model.js';
 import { type RunStatus } from './contract.js';
 import { mailLog } from './log.js';
-import { computeNextRunAt, planCatchUp, type CatchUpPlan } from './recurrence.js';
+import { computeNextRunAt, planCatchUp, stepTemplateId, type CatchUpPlan } from './recurrence.js';
 import { providerIdempotencyKey } from './retry.js';
 import { newRunRecipients, runExecutorPass } from './send-executor.js';
 import {
@@ -84,6 +84,7 @@ async function recordSkippedOccurrence(
       attempts: [],
       recipients: [],
       providerIdempotencyKey: providerIdempotencyKey(wf.userId, wf.id, occurrence),
+      templateId: stepTemplateId(modelScheduleToContract(wf.schedule), occurrence) ?? wf.templateId,
       skipReason:
         skipped > 1
           ? `STALE_OCCURRENCE (${skipped} missed while the scheduler was unavailable)`
@@ -123,6 +124,7 @@ async function createOccurrenceRun(
       attempts: [],
       recipients,
       providerIdempotencyKey: providerIdempotencyKey(wf.userId, wf.id, occurrence),
+      templateId: stepTemplateId(modelScheduleToContract(wf.schedule), occurrence) ?? wf.templateId,
       nextAttemptAt: null,
     });
     return true;
@@ -176,7 +178,12 @@ async function processDueWorkflow(wf: MailWorkflowDocument, now: Date): Promise<
     }
 
     if (plan.action === 'skip') {
-      await recordSkippedOccurrence(claimed, plan.lastSkipped, plan.skipped);
+      const skippedList = plan.skippedOccurrences.length
+        ? plan.skippedOccurrences
+        : [plan.lastSkipped];
+      for (const skippedAt of skippedList) {
+        await recordSkippedOccurrence(claimed, skippedAt, 1);
+      }
       mailLog.warn('scheduler.stale_occurrences_skipped', {
         ...ctx,
         skipped: plan.skipped,
@@ -285,6 +292,7 @@ if (process.argv[1]?.endsWith('scheduler.ts')) {
   if (storm.action === 'skip') {
     assert.equal(storm.skipped, 3);
     assert.equal(storm.runNow?.toISOString(), '2026-08-25T04:30:00.000Z');
+    assert.equal(storm.skippedOccurrences.length, 3);
   }
 
   // maxRuns is enforced before anything is claimed

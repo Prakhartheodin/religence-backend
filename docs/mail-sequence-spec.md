@@ -147,6 +147,11 @@ never repaired.
 | `templateId` | must resolve against the user's templates, or be absent |
 | `endDate`, `maxRuns` | stripped — the list length is the bound |
 
+**UX vs provider limits:** `RUN_SCAN_LIMIT = 2000` (`mail-history.ts`) is a structure/UX
+guardrail for run-history scans — not a Microsoft Graph or Exchange send ceiling.
+`MAX_SEQUENCE_STEPS = 20` caps what one sequence can plan. **Delivery is governed by
+Exchange/Graph throttling and tenant policy**, not by these UX caps.
+
 `MIN_STEP_GAP_MINUTES = 5` because the scheduler ticks every 30s (`src/index.ts:66`) and
 runs at most one occurrence per workflow per tick. Sub-minute gaps would technically work
 but arrive visibly late, which reads as a bug.
@@ -974,3 +979,29 @@ All `assert`-based, in existing self-check blocks. No new runner.
   paths are untouched; every existing assertion passes unmodified
 - **Nothing user-facing.** The chat path still cannot produce a sequence — verified by the
   absence of any `'sequence'` literal in `chat-parser.ts` after phase 1
+
+---
+
+## 18. Runtime send safeguards
+
+Enforced in `send-guard.ts` and `send-executor.ts` before each recipient dispatch. These are
+**runtime** limits — separate from the UX/structure caps in §5.
+
+| Guard | Limit | On breach |
+|---|---|---|
+| Per-mailbox send pace | ≤ 20 messages/min | Defer run (`nextAttemptAt`) |
+| Per-mailbox concurrency | ≤ 2 in-flight (`sending` recipients) | Defer |
+| Per-mailbox recipients/day (soft) | ≤ 8000 | Defer until next UTC day |
+| Tenant external recipients/day | ≤ 80% of TERRL | Defer |
+
+**TERRL unknown:** conservative fallback — assume 10,000 external recipients/day (common
+M365 default) and cap at 8,000 (80%). Set `MAIL_TENANT_EXTERNAL_RECIPIENT_LIMIT` when the
+tenant limit is known.
+
+**Retry policy** (`retry.ts`): retry only Graph `429`, `503`, `504`. Honor `Retry-After`
+when present; exponential backoff (10s → 30s → 90s) otherwise. Auth (`401`/`403`) and other
+errors are not retried.
+
+**Telemetry:** `send.guard_deferred`, `send.draft_failed`, `send.send_failed`, and
+`run.retry_scheduled` log reason, `retryAfterMs`, in-flight count, pace count, daily counts,
+and configured caps for ops/debug.
